@@ -20,6 +20,7 @@ type
       ## opaque gray RGBA frames, by size and level, to draw on (burnOver)
     files: Table[string, SubFile] # by subtitle file
     fonts: Table[string, tuple[dir, family: string]] # by font file
+    scripts: string
     graphs: Table[string, SubGraph] # by the burn action
 
 func playResY(header: string): float =
@@ -100,13 +101,13 @@ proc fontFamily*(data: string): string =
   except ValueError:
     ""
 
-proc fontDir(b: var SubBurner, font: string): tuple[dir, family: string] =
+proc fontDir(b: var SubBurner, font, name: string): tuple[dir, family: string] =
   ## A folder holding just `font`, for libass to look in, and its family.
   if font notin b.fonts:
     let data = try: readFile(font) except IOError:
-      error &"burn: can't read the font {font}"
+      error &"{name}: can't read the font {font}"
     let family = fontFamily(data)
-    if family.len == 0: error &"burn: {font} has no font family name"
+    if family.len == 0: error &"{name}: {font} has no font family name"
     let dir = getTempDir() / &"auto-editor-burn-{getCurrentProcessId()}-{hash(font).uint:x}"
     createDir(dir)
     writeFile(dir / extractFilename(font), data)
@@ -118,6 +119,38 @@ func quoted(value: string): string =
   ## closed, escaped, and reopened.
   "'" & value.replace("'", "'\\''") & "'"
 
+func assText(text: string): string =
+  for c in text:
+    case c
+    of '\n': result.add "\\N"
+    of '\\': result.add "\\\u2060"
+    of '{', '}': result.add "\\" & c
+    else: result.add c
+
+proc textScript(b: var SubBurner, text: Action, w, h: cint): string =
+  if b.scripts.len == 0:
+    b.scripts = getTempDir() / &"auto-editor-text-{getCurrentProcessId()}"
+    createDir(b.scripts)
+  result = b.scripts / &"{hash($text).uint:x}-{w}x{h}.ass"
+  let size = h.float * 0.08
+  let outline = max(1.0, h.float * 0.002)
+  let (mx, my) = (int(w.float * 0.05), int(h.float * 0.05))
+  writeFile(result, &"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {w}
+PlayResY: {h}
+ScaledBorderAndShadow: yes
+WrapStyle: 2
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,{size:.2f},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,{outline:.2f},0,5,{mx},{mx},{my},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,9:59:59.99,Default,,0,0,0,,{assText(text.burnFile)}
+""")
+
 proc close*(b: var SubBurner) =
   for f in b.solids.values:
     var f = f
@@ -128,6 +161,9 @@ proc close*(b: var SubBurner) =
   for (dir, _) in b.fonts.values:
     try: removeDir(dir) except OSError: discard
   b.fonts.clear()
+  if b.scripts.len > 0:
+    try: removeDir(b.scripts) except OSError: discard
+    b.scripts = ""
 
 proc burn*(b: var SubBurner, frame: ptr AVFrame, burn: Action,
     secs: float): ptr AVFrame =
@@ -139,12 +175,17 @@ proc burn*(b: var SubBurner, frame: ptr AVFrame, burn: Action,
     if key in b.graphs: b.graphs[key].graph.cleanup()
     if avfilter_get_by_name("subtitles") == nil:
       error "burn needs FFmpeg's subtitles filter (FFmpeg built with libass)"
-    if burn.burnFile notin b.files: b.files[burn.burnFile] = subtitleFile(burn.burnFile)
-    let file = b.files[burn.burnFile]
-    var opts = &"filename={quoted(burn.burnFile)}:stream_index={file.index}"
+    var path = burn.burnFile
+    if burn.kind == actText:
+      path = b.textScript(burn, frame.width, frame.height)
+      b.files[path] = (0, frame.height.float)
+    elif path notin b.files:
+      b.files[path] = subtitleFile(path)
+    let file = b.files[path]
+    var opts = &"filename={quoted(path)}:stream_index={file.index}"
     var style: seq[string]
     if burn.burnFont.len > 0:
-      let (dir, family) = b.fontDir(burn.burnFont)
+      let (dir, family) = b.fontDir(burn.burnFont, if burn.kind == actText: "text" else: "burn")
       opts &= ":fontsdir=" & quoted(dir)
       style.add "FontName=" & family
     if burn.burnSize > 0:
@@ -159,6 +200,9 @@ proc burn*(b: var SubBurner, frame: ptr AVFrame, burn: Action,
       # kept.
       style.add "BorderStyle=4"
       style.add "BackColour=" & assColor(burn.burnColors[bpBg])
+    if burn.burnAlign in 1'u8 .. 9'u8:
+      const ssa: array[1 .. 9, int] = [1, 2, 3, 9, 10, 11, 5, 6, 7]
+      style.add &"Alignment={ssa[burn.burnAlign]}"
     if style.len > 0: opts &= ":force_style=" & quoted(style.join(","))
     let g = newGraph()
     let nodes = @[
@@ -220,3 +264,24 @@ proc burnOver*(b: var SubBurner, frame: ptr AVFrame, burn: Action, secs: float) 
         let src = min(255.0, k[i + c].float / fa)
         dst[i + c] = uint8(round((src * fa + dst[i + c].float * da * (1 - fa)) / oa))
       dst[i + 3] = uint8(round(oa * 255))
+
+proc textBounds*(text: Action, w, h: cint): tuple[x, y, w, h: int] =
+  var b = SubBurner()
+  defer: b.close()
+  var f = av_frame_alloc()
+  if f == nil: error "Could not allocate frame"
+  defer: av_frame_free(addr f)
+  f.format = AV_PIX_FMT_RGBA.cint
+  f.width = w
+  f.height = h
+  if av_frame_get_buffer(f, 32) < 0: error "Could not allocate frame"
+  for y in 0 ..< h.int:
+    zeroMem(cast[pointer](cast[int](f.data[0]) + y * f.linesize[0].int), w.int * 4)
+  b.burnOver(f, text, 0)
+  var (x0, y0, x1, y1) = (w.int, h.int, -1, -1)
+  for y in 0 ..< h.int:
+    let row = cast[ptr UncheckedArray[uint8]](cast[int](f.data[0]) + y * f.linesize[0].int)
+    for x in 0 ..< w.int:
+      if row[x * 4 + 3] != 0:
+        (x0, y0, x1, y1) = (min(x0, x), min(y0, y), max(x1, x), max(y1, y))
+  if x1 >= 0: (x0, y0, x1 - x0 + 1, y1 - y0 + 1) else: (0, 0, 0, 0)
