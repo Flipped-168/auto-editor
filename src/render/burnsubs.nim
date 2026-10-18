@@ -4,7 +4,7 @@
 ## for what the action overrides: font file, size, and colors. A frame goes
 ## through the filter stamped with its time in the layer or clip.
 
-import std/[hashes, math, os, strformat, strutils, tables, unicode]
+import std/[atomics, hashes, math, os, strformat, strutils, tables, unicode]
 import ../[action, av, ffmpeg, graph, log]
 import ../util/rational
 
@@ -22,6 +22,14 @@ type
     fonts: Table[string, tuple[dir, family: string]] # by font file
     scripts: string
     graphs: Table[string, SubGraph] # by the burn action
+    id: int
+
+var fallbackFont*: string
+var burners: Atomic[int]
+
+proc tag(b: var SubBurner): string =
+  if b.id == 0: b.id = burners.fetchAdd(1) + 1
+  &"{getCurrentProcessId()}-{b.id}"
 
 func playResY(header: string): float =
   ## The height an ASS script's coordinates (and font sizes) are in, as libass
@@ -108,7 +116,7 @@ proc fontDir(b: var SubBurner, font, name: string): tuple[dir, family: string] =
       error &"{name}: can't read the font {font}"
     let family = fontFamily(data)
     if family.len == 0: error &"{name}: {font} has no font family name"
-    let dir = getTempDir() / &"auto-editor-burn-{getCurrentProcessId()}-{hash(font).uint:x}"
+    let dir = getTempDir() / &"auto-editor-burn-{b.tag}-{hash(font).uint:x}"
     createDir(dir)
     writeFile(dir / extractFilename(font), data)
     b.fonts[font] = (dir, family)
@@ -127,14 +135,53 @@ func assText(text: string): string =
     of '{', '}': result.add "\\" & c
     else: result.add c
 
+func vertAlignParts(align: uint8): tuple[h, v: string] =
+  if align notin 1'u8 .. 9'u8:
+    return ("center", "middle")
+  let name = alignNames[align]
+  let h = (if "left" in name: "left" elif "right" in name: "right" else: "center")
+  let v = (if "top" in name: "top" elif "bottom" in name: "bottom" else: "middle")
+  (h, v)
+
+func verticalEvents(text: string, cell, w, h: float, align: uint8): string =
+  let lines = text.splitLines()
+  var maxChars = 0
+  for line in lines: maxChars = max(maxChars, line.runeLen)
+  let totalW = lines.len.float * cell
+  let totalH = maxChars.float * cell
+  let (mx, my) = (w * 0.05, h * 0.05)
+  let (ha, va) = vertAlignParts(align)
+  let x0 = case ha
+    of "left": mx
+    of "right": w - mx - totalW
+    else: (w - totalW) / 2
+  let y0 = case va
+    of "top": my
+    of "bottom": h - my - totalH
+    else: (h - totalH) / 2
+  for i, line in lines:
+    var j = 0
+    for ch in line.runes:
+      let cx = x0 + totalW - cell * (i.float + 1) + cell / 2
+      let cy = y0 + cell * j.float + cell / 2
+      result &= &"Dialogue: 0,0:00:00.00,9:59:59.99,Default,,0,0,0,," &
+        &"{{\\an5\\pos({cx:.2f},{cy:.2f})}}{assText($ch)}\n"
+      inc j
+
 proc textScript(b: var SubBurner, text: Action, w, h: cint): string =
   if b.scripts.len == 0:
-    b.scripts = getTempDir() / &"auto-editor-text-{getCurrentProcessId()}"
+    b.scripts = getTempDir() / &"auto-editor-text-{b.tag}"
     createDir(b.scripts)
   result = b.scripts / &"{hash($text).uint:x}-{w}x{h}.ass"
   let size = h.float * 0.08
   let outline = max(1.0, h.float * 0.002)
   let (mx, my) = (int(w.float * 0.05), int(h.float * 0.05))
+  let events =
+    if text.burnVertical:
+      let fontsize = (if text.burnSize > 0: text.burnSize.float * h.float / 100 else: size)
+      verticalEvents(text.burnFile, fontsize * 1.15, w.float, h.float, text.burnAlign)
+    else:
+      &"Dialogue: 0,0:00:00.00,9:59:59.99,Default,,0,0,0,,{assText(text.burnFile)}\n"
   writeFile(result, &"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {w}
@@ -148,8 +195,7 @@ Style: Default,Arial,{size:.2f},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-Dialogue: 0,0:00:00.00,9:59:59.99,Default,,0,0,0,,{assText(text.burnFile)}
-""")
+{events}""")
 
 proc close*(b: var SubBurner) =
   for f in b.solids.values:
@@ -184,8 +230,9 @@ proc burn*(b: var SubBurner, frame: ptr AVFrame, burn: Action,
     let file = b.files[path]
     var opts = &"filename={quoted(path)}:stream_index={file.index}"
     var style: seq[string]
-    if burn.burnFont.len > 0:
-      let (dir, family) = b.fontDir(burn.burnFont, if burn.kind == actText: "text" else: "burn")
+    let font = if burn.burnFont.len > 0: burn.burnFont else: fallbackFont
+    if font.len > 0:
+      let (dir, family) = b.fontDir(font, if burn.kind == actText: "text" else: "burn")
       opts &= ":fontsdir=" & quoted(dir)
       style.add "FontName=" & family
     if burn.burnSize > 0:
