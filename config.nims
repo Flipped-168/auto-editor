@@ -40,6 +40,13 @@ when defined(dynamic):
     switch("define", "whisper")
     switch("passC", whisperCflags.output.strip())
     switch("passL", whisperLibs.output.strip())
+
+  let assCflags = gorgeEx("pkg-config --cflags libass", "")
+  let assLibs = gorgeEx("pkg-config --libs libass", "")
+  if enableLibass and assCflags.exitCode == 0 and assLibs.exitCode == 0:
+    switch("define", "libass")
+    switch("passC", assCflags.output.strip())
+    switch("passL", assLibs.output.strip())
 else:
   switch("passC", &"-I./{buildPath}/include")
   switch("passL", &"-L./{buildPath}/lib")
@@ -119,11 +126,9 @@ if not defined(dynamic):
         not (hostCPU == "arm" and hostOS == "linux"):
       switch("passL", "-lvpl")
   if enableLibass:
-    # The subtitles filter's libass, and what it uses, after what uses them.
-    when defined(linux) and not defined(emscripten):
-      switch("passL", "-lass -lfontconfig -lharfbuzz -lfribidi -lfreetype -lexpat")
-    else:
-      switch("passL", "-lass -lharfbuzz -lfribidi -lfreetype")
+    # libass, for burn and text, and what it uses, after what uses them.
+    switch("define", "libass")
+    switch("passL", "-lass -lharfbuzz -lfribidi -lfreetype")
     when defined(macosx):
       # Core Text finds the system's fonts; iconv is macOS's own.
       switch("passL", "-liconv -framework ApplicationServices")
