@@ -166,10 +166,10 @@ let libvpl = Package(
   ],
   ffFlag: "--enable-libvpl",
 )
-let lamer = Package(
-  name: "lamer",
-  sourceUrl: "https://github.com/basswood-io/lamer/archive/refs/tags/v3.101.0.tar.gz",
-  sha256: "81839b16fdc401e20b73389d05f32a7656008f43bcb960feff290d6f08fc109e",
+let bwlame = Package(
+  name: "bwlame",
+  sourceUrl: "https://github.com/basswood-io/bwlame/archive/refs/tags/v4.1.0.tar.gz",
+  sha256: "f07647a8db7cf511cb6a82e69483bc3c1ad87355995a74193801029c368cb45c",
   buildSystem: "make",
   ffFlag: "--enable-libmp3lame",
 )
@@ -266,17 +266,18 @@ let fribidi = Package(
 )
 let harfbuzz = Package(
   name: "harfbuzz",
-  sourceUrl: "https://github.com/harfbuzz/harfbuzz/releases/download/11.2.1/harfbuzz-11.2.1.tar.xz",
-  sha256: "093714c8548a285094685f0bdc999e202d666b59eeb3df2ff921ab68b8336a49",
+  sourceUrl: "https://github.com/harfbuzz/harfbuzz/releases/download/15.0.0/harfbuzz-15.0.0.tar.xz",
+  sha256: "968536e9abd782f07f7954044c0c4020199fcdd39b41d221ec42d2a3be4a44df",
   buildSystem: "meson",
   buildArguments: @["--auto-features=disabled", "-Dtests=disabled",
     "-Ddocs=disabled", "-Dutilities=disabled", "-Dintrospection=disabled",
-    "-Dbenchmark=disabled"],
+    "-Dbenchmark=disabled", "-Draster=disabled", "-Dvector=disabled",
+    "-Dgpu=disabled", "-Dsubset=disabled"],
 )
 let libass = Package(
   name: "libass",
-  sourceUrl: "https://github.com/libass/libass/releases/download/0.17.4/libass-0.17.4.tar.xz",
-  sha256: "78f1179b838d025e9c26e8fef33f8092f65611444ffa1bfc0cfac6a33511a05a",
+  sourceUrl: "https://github.com/libass/libass/releases/download/0.17.5/libass-0.17.5.tar.xz",
+  sha256: "2dca25c0e0c837ddf00b52011b3f82cac1e4ddd3ad018227806b0c2288864acc",
   buildSystem: "meson",
   buildArguments: @["--auto-features=disabled", "-Dtest=disabled",
     "-Dcompare=disabled", "-Dprofile=disabled", "-Dfuzz=disabled",
@@ -303,7 +304,7 @@ proc selectPackages(kind: CrossKind = native): seq[Package] =
     result.add libvpl
   if enableWhisper:
     result.add whisper
-  result &= [lamer, opus, dav1d, x264, zlib]
+  result &= [bwlame, opus, dav1d, x264, zlib]
   if enableLibass:
     result &= [freetype, fribidi, harfbuzz]
     result.add libass
@@ -329,8 +330,8 @@ func dirName(package: Package): string =
     return "AMF-1.5.2"
   if package.name == "whisper":
     return "whisper.cpp-1.9.5"
-  if package.name == "lamer":
-    return "lamer-3.101.0"
+  if package.name == "bwlame":
+    return "bwlame-4.1.0"
 
   var name = package.location
   for ext in [".tar.gz", ".tar.xz", ".tar.bz2", ".orig"]:
@@ -658,20 +659,16 @@ proc x265Build(buildPath: string, kind: CrossKind) =
   let dir10bit = pkgDir / "x265_10bit"
   let dir8bit = pkgDir / "x265_8bit"
 
-  # For 10bit version, only x86_64 has assembly instructions available
   var highBitDepthArgs: seq[string] = @[
     "-DHIGH_BIT_DEPTH=1",
     "-DEXPORT_C_API=0",
     "-DENABLE_SHARED=0",
     "-DENABLE_CLI=0"
   ]
-  let isLinuxAarch64 = hostOS == "linux" and hostCPU == "arm64"
 
-  if hostCPU != "amd64" or kind == winArm or isWasm:
+  # 32-bit ARM has no 10-bit assembly, wasm has none at all
+  if kind == armv7 or isWasm:
     highBitDepthArgs.add("-DENABLE_ASSEMBLY=0")
-
-  if isLinuxAarch64:
-    highBitDepthArgs.add("-DENABLE_SVE2=0")
 
   var commonArgs = @[
     &"-DCMAKE_INSTALL_PREFIX={buildPath}",
@@ -688,7 +685,6 @@ proc x265Build(buildPath: string, kind: CrossKind) =
   if kind == winArm:
     let toolchainFile = buildPath.parentDir / "scripts" / "aarch64-w64-mingw32.cmake"
     commonArgs.add(&"-DCMAKE_TOOLCHAIN_FILE={toolchainFile}")
-    highBitDepthArgs.add("-DENABLE_ASSEMBLY=0")  # No x86 assembly for ARM64
   elif kind == winX64:
     let toolchainFile = buildPath.parentDir / "scripts" / "x86_64-w64-mingw32.cmake"
     commonArgs.add(&"-DCMAKE_TOOLCHAIN_FILE={toolchainFile}")
@@ -719,9 +715,6 @@ proc x265Build(buildPath: string, kind: CrossKind) =
     cmake8Cmd &= " -DENABLE_ASSEMBLY=0"
   for arg in commonArgs:
     cmake8Cmd &= " " & arg
-
-  if isLinuxAarch64:
-    cmake8Cmd &= " -DENABLE_SVE2=0"
 
   echo "RUN: ", cmake8Cmd
   exec cmake8Cmd
@@ -1116,7 +1109,7 @@ proc setupDeps =
     exec "pip install " & toInstall.join(" ")
 
 task downloaddeps, "Download and Extract Cxx Dependencies":
-  let allPackages = @[ffmpeg, nvheaders, amfheaders, alsa, libvpl, whisper, lamer, opus, dav1d, x264, zlib, vpx, svtav1, x265, freetype, fribidi, harfbuzz, libass]
+  let allPackages = @[ffmpeg, nvheaders, amfheaders, alsa, libvpl, whisper, bwlame, opus, dav1d, x264, zlib, vpx, svtav1, x265, freetype, fribidi, harfbuzz, libass]
   mkDir "ffmpeg_sources"
   withDir "ffmpeg_sources":
     for package in allPackages:

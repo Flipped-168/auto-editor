@@ -48,8 +48,6 @@ jobs:
             binary_name: auto-editor-linux-x86_64
           - os: ubuntu-24.04-arm
             binary_name: auto-editor-linux-aarch64
-          - os: macos-15-intel
-            binary_name: auto-editor-macos-x86_64
           - os: macos-latest
             binary_name: auto-editor-macos-arm64
     steps:
