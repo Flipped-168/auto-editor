@@ -83,6 +83,7 @@ const AV_PIX_FMT_GRAY8* = AVPixelFormat(8)
 proc av_pix_fmt_desc_get*(pix_fmt: AVPixelFormat): ptr AVPixFmtDescriptor {.importc,
     header: "<libavutil/pixdesc.h>".}
 
+const AV_PIX_FMT_FLAG_BITSTREAM* = 1'u64 shl 2
 const AV_PIX_FMT_FLAG_PLANAR* = 1'u64 shl 4
 const AV_PIX_FMT_FLAG_RGB* = 1'u64 shl 5
 const AV_PIX_FMT_FLAG_ALPHA* = 1'u64 shl 7
@@ -91,6 +92,11 @@ func isRgb*(pix_fmt: AVPixelFormat): bool =
   ## True for RGB pixel formats (rgb24, bgr0, gbrp, ...) as opposed to YUV and gray.
   let d = av_pix_fmt_desc_get(pix_fmt)
   d != nil and (d.flags and AV_PIX_FMT_FLAG_RGB) != 0'u64
+
+func isBitstream*(pix_fmt: AVPixelFormat): bool =
+  ## True for formats packing several pixels per byte (monob, monow, rgb4, ...).
+  let d = av_pix_fmt_desc_get(pix_fmt)
+  d != nil and (d.flags and AV_PIX_FMT_FLAG_BITSTREAM) != 0'u64
 
 func hasAlpha*(pix_fmt: AVPixelFormat): bool =
   ## True if the pixel format carries an alpha channel (e.g. rgba, yuva420p).
@@ -473,7 +479,7 @@ type
     decode_error_flags*: cint
     hw_frames_ctx: pointer
     opaque_ref: pointer
-    crop_top, crop_bottom, crop_left, crop_right: csize_t
+    crop_top*, crop_bottom*, crop_left*, crop_right*: csize_t
     private_ref: pointer
     ch_layout*: AVChannelLayout
     duration*: int64
@@ -535,6 +541,12 @@ proc av_frame_make_writable*(frame: ptr AVFrame): cint {.importc,
     header: "<libavutil/frame.h>".}
 proc av_frame_clone*(src: ptr AVFrame): ptr AVFrame {.importc,
     header: "<libavutil/frame.h>".}
+proc av_frame_move_ref*(dst, src: ptr AVFrame) {.importc,
+    header: "<libavutil/frame.h>".}
+proc av_frame_apply_cropping*(frame: ptr AVFrame, flags: cint): cint {.importc,
+    header: "<libavutil/frame.h>".}
+
+const AV_FRAME_CROP_UNALIGNED* = 1.cint
 
 type
   AVTXContext* {.importc, header: "<libavutil/tx.h>", incompleteStruct.} = object

@@ -69,7 +69,7 @@ type VideoProcessor* = object
   videoIndex*: cint
 
 proc createFilterGraph(timeBase: AVRational, pixFmtName: string,
-    codecCtx: ptr AVCodecContext, filter: string): (ptr AVFilterGraph,
+    width, height: cint, filter: string): (ptr AVFilterGraph,
     ptr AVFilterContext, ptr AVFilterContext) =
   var filterGraph: ptr AVFilterGraph = avfilter_graph_alloc()
   var bufferSrc: ptr AVFilterContext = nil
@@ -77,9 +77,6 @@ proc createFilterGraph(timeBase: AVRational, pixFmtName: string,
 
   if filterGraph == nil:
     error "Could not allocate filter graph"
-
-  let width = codecCtx.width
-  let height = codecCtx.height
 
   # Create buffer source with proper arguments
   let bufferArgs = cstring(
@@ -127,7 +124,10 @@ proc createFilterGraph(timeBase: AVRational, pixFmtName: string,
 
   return (filterGraph, bufferSrc, bufferSink)
 
-iterator videoPipeline*(processor: VideoProcessor, filter: string): ptr AVFrame =
+iterator videoPipeline*(processor: VideoProcessor, filter: string,
+    crop: tuple[x, y, w, h: cint] = (0.cint, 0.cint, 0.cint, 0.cint)): ptr AVFrame =
+  ## Decode and run each frame through `filter`, after cropping it to `crop`
+  ## when `crop.w` is set.
   var packet = av_packet_alloc()
   var frame = av_frame_alloc()
   var filteredFrame = av_frame_alloc()
@@ -145,14 +145,50 @@ iterator videoPipeline*(processor: VideoProcessor, filter: string): ptr AVFrame 
 
   let timeBase = processor.tb
 
-  let pixelFormat = processor.codecCtx.pix_fmt
+  # Cropping moves data pointers, which can't land mid-byte, so FFmpeg skips
+  # the left and top crop for 1-bit formats. Those frames go to gray first.
+  let toGray = crop.w > 0 and processor.codecCtx.pix_fmt.isBitstream
+  let pixelFormat = (if toGray: AV_PIX_FMT_GRAY8 else: processor.codecCtx.pix_fmt)
   let pixFmtName = $pixelFormat
   if pixFmtName == "":
     error &"Could not get pixel format name for format: {ord(pixelFormat)}"
 
-  let (filterGraph, bufferSrc, bufferSink) = createFilterGraph(
-    timeBase, pixFmtName, processor.codecCtx, filter
-  )
+  var graySws: ptr SwsContext = nil
+  var grayFrame: ptr AVFrame = nil
+  if toGray:
+    graySws = sws_alloc_context()
+    grayFrame = av_frame_alloc()
+    if graySws == nil or grayFrame == nil:
+      error "Could not allocate gray conversion"
+  defer:
+    sws_free_context(addr graySws)
+    av_frame_free(addr grayFrame)
+
+  let (filterGraph, bufferSrc, bufferSink) =
+    if crop.w > 0:
+      createFilterGraph(timeBase, pixFmtName, crop.w, crop.h, filter)
+    else:
+      createFilterGraph(timeBase, pixFmtName, processor.codecCtx.width,
+        processor.codecCtx.height, filter)
+
+  template applyCrop() =
+    if toGray:
+      av_frame_unref(grayFrame)
+      grayFrame.format = AV_PIX_FMT_GRAY8.cint
+      grayFrame.width = frame.width
+      grayFrame.height = frame.height
+      if sws_scale_frame(graySws, grayFrame, frame) < 0:
+        error "Could not convert frame to gray"
+      grayFrame.pts = frame.pts
+      av_frame_unref(frame)
+      av_frame_move_ref(frame, grayFrame)
+    if crop.w > 0:
+      # Clamp to this frame: the stream can change resolution mid-way.
+      let cw = min(crop.w, frame.width)
+      let ch = min(crop.h, frame.height)
+      let cx = min(crop.x, frame.width - cw)
+      let cy = min(crop.y, frame.height - ch)
+      cropView(frame, cx, cy, frame.width - cw - cx, frame.height - ch - cy)
 
   defer:
     if filterGraph != nil:
@@ -179,6 +215,7 @@ iterator videoPipeline*(processor: VideoProcessor, filter: string): ptr AVFrame 
         if frame.pts == AV_NOPTS_VALUE:
           continue
 
+        applyCrop()
         if av_buffersrc_write_frame(bufferSrc, frame) < 0:
           error "Error adding frame to filter"
 
@@ -195,6 +232,7 @@ iterator videoPipeline*(processor: VideoProcessor, filter: string): ptr AVFrame 
     if frame.pts == AV_NOPTS_VALUE:
       continue
 
+    applyCrop()
     ret = av_buffersrc_write_frame(bufferSrc, frame)
     if ret >= 0:
       ret = av_buffersink_get_frame(bufferSink, filteredFrame)
@@ -223,17 +261,26 @@ iterator motionness*(processor: var VideoProcessor, width, blur: int32,
     if currentFrame != nil:
       dealloc(currentFrame)
 
-  var filter = &"scale={width}:-1,format=gray,gblur=sigma={blur}"
-  if x != 0.0 or y != 0.0 or w != 1.0 or h != 1.0:
-    # Crop before scaling so the analyzed region gets the full `width` resolution.
-    let iw = processor.codecCtx.width
-    let ih = processor.codecCtx.height
-    let cw = max(1'i32, int32(round(iw.float32 * w)))
-    let ch = max(1'i32, int32(round(ih.float32 * h)))
-    let cx = clamp(int32(round(iw.float32 * x)), 0'i32, iw - cw)
-    let cy = clamp(int32(round(ih.float32 * y)), 0'i32, ih - ch)
-    filter = &"crop={cw}:{ch}:{cx}:{cy}," & filter
-  for filteredFrame in processor.videoPipeline(filter):
+  let filter = &"scale={width}:-1,format=gray,gblur=sigma={blur}"
+  let crop =
+    if x != 0.0 or y != 0.0 or w != 1.0 or h != 1.0:
+      # Crop before scaling so the analyzed region gets the full `width` resolution.
+      let iw = processor.codecCtx.width
+      let ih = processor.codecCtx.height
+      let d = av_pix_fmt_desc_get(processor.codecCtx.pix_fmt)
+      let (hsub, vsub) =
+        if d == nil: (0, 0) else: (d.log2_chroma_w.int, d.log2_chroma_h.int)
+      let hmask = not ((1.cint shl hsub) - 1)
+      let vmask = not ((1.cint shl vsub) - 1)
+      let cw = max(1'i32, int32(round(iw.float32 * w)))
+      let ch = max(1'i32, int32(round(ih.float32 * h)))
+      let cx = clamp(int32(round(iw.float32 * x)), 0'i32, iw - cw)
+      let cy = clamp(int32(round(ih.float32 * y)), 0'i32, ih - ch)
+      # Snap to the chroma subsampling so chroma stays lined up with luma.
+      (cx and hmask, cy and vmask, max(cw and hmask, 1), max(ch and vmask, 1))
+    else:
+      (0.cint, 0.cint, 0.cint, 0.cint)
+  for filteredFrame in processor.videoPipeline(filter, crop):
     let frameTime = (filteredFrame.pts * processor.formatCtx.streams[
         processor.videoIndex].time_base).float64
     let index = round(frameTime * processor.tb.float64).int64
