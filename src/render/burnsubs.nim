@@ -44,32 +44,35 @@ func assColor(c: uint32): string =
   let (r, g, b, a) = (c shr 24, (c shr 16) and 0xff, (c shr 8) and 0xff, c and 0xff)
   "&H" & toHex(int(((255 - a) shl 24) or (b shl 16) or (g shl 8) or r), 8)
 
+proc u16(data: string, at: int): int =
+  if at < 0 or at + 2 > data.len: raise newException(ValueError, "truncated font")
+  (data[at].ord shl 8) or data[at + 1].ord
+
+proc u32(data: string, at: int): int = (data.u16(at) shl 16) or data.u16(at + 2)
+
 proc fontFamily*(data: string): string =
   ## The family name in a TrueType/OpenType font's `name` table (the first
   ## face of a collection), as libass matches fonts by; "" if it has none.
-  proc u16(at: int): int =
-    if at < 0 or at + 2 > data.len: raise newException(ValueError, "truncated font")
-    (data[at].ord shl 8) or data[at + 1].ord
-  proc u32(at: int): int = (u16(at) shl 16) or u16(at + 2)
   try:
-    let face = if data.startsWith("ttcf"): u32(12) else: 0
+    let face = if data.startsWith("ttcf"): data.u32(12) else: 0
     var table = -1
-    for i in 0 ..< u16(face + 4):
+    for i in 0 ..< data.u16(face + 4):
       let rec = face + 12 + 16 * i
-      if rec + 4 <= data.len and data[rec ..< rec + 4] == "name": table = u32(rec + 8)
+      if rec + 4 <= data.len and data[rec ..< rec + 4] == "name":
+        table = data.u32(rec + 8)
     if table < 0: return ""
-    let strings = table + u16(table + 4)
+    let strings = table + data.u16(table + 4)
     # The family (name 1), in a Unicode encoding before Mac Roman.
     var best = (rank: 99, text: "")
-    for i in 0 ..< u16(table + 2):
+    for i in 0 ..< data.u16(table + 2):
       let rec = table + 6 + 12 * i
-      if u16(rec + 6) != 1: continue
-      let rank = case u16(rec)
+      if data.u16(rec + 6) != 1: continue
+      let rank = case data.u16(rec)
         of 3: 0
         of 0: 1
         of 1: 2
         else: 99
-      let (len, at) = (u16(rec + 8), strings + u16(rec + 10))
+      let (len, at) = (data.u16(rec + 8), strings + data.u16(rec + 10))
       if rank >= best.rank or at + len > data.len: continue
       var text = ""
       if rank == 2:
@@ -77,7 +80,7 @@ proc fontFamily*(data: string): string =
       else:
         var k = at
         while k + 1 < at + len:
-          text.add Rune(u16(k)).toUTF8
+          text.add Rune(data.u16(k)).toUTF8
           k += 2
       best = (rank, text)
     best.text
@@ -397,6 +400,35 @@ when defined(libass):
     else:
       for i in 1 .. 2: result[i] += 0.5
 
+  proc at(frame: ptr AVFrame, c: AVComponentDescriptor, x, y: int): pointer =
+    cast[pointer](cast[int](frame.data[c.plane]) + y * frame.linesize[c.plane].int +
+      x * c.step.int + c.offset.int)
+
+  proc load(p: pointer, wide: bool): int =
+    if wide: cast[ptr uint16](p)[].int else: cast[ptr uint8](p)[].int
+
+  proc store(p: pointer, n: int, wide: bool) =
+    if wide: cast[ptr uint16](p)[] = n.uint16 else: cast[ptr uint8](p)[] = n.uint8
+
+  proc mask(masks: var seq[Mask], img: ptr ASS_Image, x0, y0, x1, y1, opacity,
+      sw, sh: int): ptr Mask =
+    ## `img`'s coverage over the clipped box, times `opacity`, at a plane's
+    ## subsampling. The chroma components share theirs.
+    for m in masks.mitems:
+      if (m.sw, m.sh) == (sw, sh): return addr m
+    let (cx0, cy0) = (x0 shr sw, y0 shr sh)
+    var m = Mask(sw: sw, sh: sh, w: ((x1 - 1) shr sw) - cx0 + 1,
+      full: (255 * 255) shl (sw + sh))
+    m.cov = newSeq[int](m.w * (((y1 - 1) shr sh) - cy0 + 1))
+    for y in y0 ..< y1:
+      let row = (y - img.dst_y) * img.stride - img.dst_x
+      let at = ((y shr sh) - cy0) * m.w - cx0
+      for x in x0 ..< x1:
+        m.cov[at + (x shr sw)] += img.bitmap[row + x].int
+    for v in m.cov.mitems: v *= opacity
+    masks.add m
+    addr masks[^1]
+
   proc blend(frame: ptr AVFrame, img: ptr ASS_Image, track: ptr ASS_Track,
       masks: var seq[Mask]) =
     ## Draws one of libass's images, a color through a coverage mask, over
@@ -412,37 +444,12 @@ when defined(libass):
     let wide = d.comp[0].depth > 8
     let target = colorIn(frame, d, track, img.color)
 
-    proc at(c: AVComponentDescriptor, x, y: int): pointer =
-      cast[pointer](cast[int](frame.data[c.plane]) + y * frame.linesize[c.plane].int +
-        x * c.step.int + c.offset.int)
-    proc load(p: pointer): int =
-      if wide: cast[ptr uint16](p)[].int else: cast[ptr uint8](p)[].int
-    proc store(p: pointer, n: int) =
-      if wide: cast[ptr uint16](p)[] = n.uint16 else: cast[ptr uint8](p)[] = n.uint8
-
-    proc mask(masks: var seq[Mask], sw, sh: int): ptr Mask =
-      # The chroma components share theirs.
-      for m in masks.mitems:
-        if (m.sw, m.sh) == (sw, sh): return addr m
-      let (cx0, cy0) = (x0 shr sw, y0 shr sh)
-      var m = Mask(sw: sw, sh: sh, w: ((x1 - 1) shr sw) - cx0 + 1,
-        full: (255 * 255) shl (sw + sh))
-      m.cov = newSeq[int](m.w * (((y1 - 1) shr sh) - cy0 + 1))
-      for y in y0 ..< y1:
-        let row = (y - img.dst_y) * img.stride - img.dst_x
-        let at = ((y shr sh) - cy0) * m.w - cx0
-        for x in x0 ..< x1:
-          m.cov[at + (x shr sw)] += img.bitmap[row + x].int
-      for v in m.cov.mitems: v *= opacity
-      masks.add m
-      addr masks[^1]
-
     let alpha = d.comp[d.nb_components.int - 1]
     # The colors first, each over the alpha as it was.
     for i in 0 ..< colors:
       let chroma = i > 0 and (d.flags and AV_PIX_FMT_FLAG_RGB) == 0
       let (sw, sh) = (if chroma: (d.log2_chroma_w.int, d.log2_chroma_h.int) else: (0, 0))
-      let m = masks.mask(sw, sh)
+      let m = masks.mask(img, x0, y0, x1, y1, opacity, sw, sh)
       let full = m.full
       let c = d.comp[i]
       let top = (1 shl (c.depth + c.shift)) - 1
@@ -452,28 +459,30 @@ when defined(libass):
         for cx in (x0 shr sw) .. ((x1 - 1) shr sw):
           let a = m.cov[row + cx]
           if a == 0: continue
-          let p = at(c, cx, cy)
-          let v = load(p)
+          let p = frame.at(c, cx, cy)
+          let v = load(p, wide)
           if hasAlpha:
             let a = a / full
-            let da = load(at(alpha, cx, cy)) / top
+            let da = load(frame.at(alpha, cx, cy), wide) / top
             let oa = a + da * (1 - a)
-            store(p, int(round((target[i] * a + v / top * da * (1 - a)) / oa * top.float)))
+            store(p, int(round((target[i] * a + v / top * da * (1 - a)) / oa * top.float)),
+              wide)
           else:
             # Without alpha it's a mix toward the color, which needs no floats.
             let m = (t - v) * a
-            store(p, v + (if m >= 0: (m + full div 2) div full else: -((full div 2 - m) div full)))
+            store(p, v + (if m >= 0: (m + full div 2) div full else: -((full div 2 - m) div full)),
+              wide)
     if hasAlpha:
-      let m = masks.mask(0, 0)
+      let m = masks.mask(img, x0, y0, x1, y1, opacity, 0, 0)
       let top = (1 shl (alpha.depth + alpha.shift)) - 1
       for y in y0 ..< y1:
         let row = (y - y0) * m.w - x0
         for x in x0 ..< x1:
           let a = m.cov[row + x]
           if a > 0:
-            let p = at(alpha, x, y)
+            let p = frame.at(alpha, x, y)
             let a = a / m.full
-            store(p, int(round((a + load(p) / top * (1 - a)) * top.float)))
+            store(p, int(round((a + load(p, wide) / top * (1 - a)) * top.float)), wide)
 
 proc burn*(b: var SubBurner, frame: ptr AVFrame, burn: Action, secs: float,
     media = "") =
