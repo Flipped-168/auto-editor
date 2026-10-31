@@ -6,6 +6,7 @@ when defined(windows):
 
 import ../[action, ffmpeg, media, timeline]
 import ../util/[fun, rational]
+import ../lib/speedmap
 
 #[
 Premiere Pro uses the Final Cut Pro 7 XML Interchange Format
@@ -51,14 +52,36 @@ func param(id, name, value: string, min = "", max = ""): XmlNode =
   p.add elem("value", value)
   return p
 
-func speedup(speed: float): XmlNode =
+func mediaFrame(map: SpeedMap, clip: Clip, frame: int64): float64 =
+  ## The source frame at `frame` in the clip's speed-scaled frames, which
+  ## <in> and <out> count.
+  if not map.ramp: return frame.float64 * map.mean
+  map.mean * (clip.offset.float64 + clip.dur.float64 *
+    map.mediaAt(float64(frame - clip.offset) / clip.dur.float64))
+
+proc speedup(map: SpeedMap, clip: Clip, inFrame, outFrame: int64): XmlNode =
   let fil = newElement("filter")
   let effect = newElement("effect")
   effect.add elem("name", "Time Remap")
   effect.add elem("effectid", "timeremap")
-  effect.add param("variablespeed", "variablespeed", "0", "0", "1")
-  effect.add param("speed", "speed", $speed, "-100000", "100000")
+  effect.add param("variablespeed", "variablespeed", (if map.ramp: "1" else: "0"),
+    "0", "1")
+  effect.add param("speed", "speed", $(map.mean * 100), "-100000", "100000")
   effect.add param("frameblending", "frameblending", "FALSE")
+  if map.ramp:
+    # A ramp's source frame at each frame from <in> to <out>, which the
+    # editor joins with straight lines.
+    let graph = param("graphdict", "graphdict", "0")
+    let step = max(1'i64, (outFrame - inFrame) div 32)
+    var frame = inFrame
+    while true:
+      let kf = newElement("keyframe")
+      kf.add elem("when", $frame)
+      kf.add elem("value", $round(map.mediaFrame(clip, frame), 3))
+      graph.add kf
+      if frame >= outFrame: break
+      frame = min(frame + step, outFrame)
+    effect.add graph
   fil.add effect
 
   return fil
@@ -135,15 +158,27 @@ func audioLevelsFilter(act: Action, inFrame, outFrame, dur: int64,
   result = newElement("filter")
   result.add effect
 
-func clipFilters(effects: Actions, isVideo: bool, inFrame, outFrame, dur: int64,
-    fps: float): seq[XmlNode] =
+proc addTicks(clipitem: XmlNode, effects: Actions, clip: Clip,
+    inFrame, outFrame: int64, tb: AVRational, video: bool) =
+  ## Premiere's source times for <in> and <out>, which count frames after the
+  ## speed change while the ticks count before it. Premiere keeps video on
+  ## whole source frames, the ones the render shows, and audio exact.
+  let map = initSpeedMap(effects)
+  let perFrame = pproTicksPerSecond.float * tb.den.float / tb.num.float
+  for (tag, frame) in [("pproTicksIn", inFrame), ("pproTicksOut", outFrame)]:
+    let source = map.mediaFrame(clip, frame)
+    let ticks = (if video: round(source) else: source) * perFrame
+    clipitem.add elem(tag, $int64(round(ticks)))
+
+proc clipFilters(effects: Actions, clip: Clip, isVideo: bool, inFrame, outFrame,
+    dur: int64, fps: float): seq[XmlNode] =
   var seen: set[ActionKind]
   for a in effects:
     if a.kind in seen: continue
     seen.incl a.kind
     case a.kind
     of actSpeed:
-      result.add speedup(a.val * 100)
+      result.add speedup(initSpeedMap(effects), clip, inFrame, outFrame)
     of actOpacity:
       if isVideo:
         result.add opacityFilter(a, inFrame, outFrame, dur, fps)
@@ -228,85 +263,116 @@ proc makeFiledef(files: var FileDefs, clipitem: XmlNode, mi: MediaInfo,
 proc dissolveItem(t: Transition, mediaType: string, timebase: int64,
     ntsc: string): XmlNode
 
-proc resolveWriteAudio(audio: XmlNode, files: var FileDefs, tl: v3,
-    ptrToMi: Table[ptr string, MediaInfo],
-    timebase: int64, ntsc: string) =
+func channelsOf(mi: MediaInfo, stream: int16): int =
+  if stream >= 0 and stream.int < mi.a.len: max(1, mi.a[stream].channels.int) else: 1
+
+type ResolveAudioIds = seq[seq[seq[int]]] # [layer][channel][clip] -> clipitem id; 0 if none
+
+proc planResolveAudio(tl: v3, ptrToMi: Table[ptr string, MediaInfo]): ResolveAudioIds =
+  ## Resolve imports every audio clipitem as mono, reading trackindex as a
+  ## channel of the file's first audio stream, so each channel gets its own
+  ## track. setStreamTo0 has already made every clip's stream the first.
   # Ids must be unique across every audio track (a per-track j would repeat
   # them, making <link> refs ambiguous); audio continues after the video ids.
   var nextId = (if tl.v.len > 0: tl.v[0].len else: 0)
+  for alayer in tl.a:
+    var channels = 1
+    for aclip in alayer:
+      if aclip.src != nil:
+        channels = max(channels, ptrToMi[aclip.src].channelsOf(aclip.stream))
+    var layer = newSeq[seq[int]](channels)
+    for sub in 0 ..< channels:
+      layer[sub] = newSeq[int](alayer.len)
+      for j, aclip in alayer:
+        if aclip.src != nil and sub < ptrToMi[aclip.src].channelsOf(aclip.stream):
+          nextId += 1
+          layer[sub][j] = nextId
+    result.add layer
+
+proc addResolveLinks(clipitem: XmlNode, tl: v3, audioIds: ResolveAudioIds, j: int) =
+  ## Link the video clip and every audio channel at position `j` together, so
+  ## they move as one.
+  var members: seq[(int, string)]
+  if tl.v.len > 0 and j < tl.v[0].len and tl.v[0][j].src != nil:
+    members.add (j + 1, "video")
+  for layer in audioIds:
+    for ids in layer:
+      if j < ids.len and ids[j] != 0:
+        members.add (ids[j], "audio")
+  if members.len < 2:
+    return
+  for (id, mediaType) in members:
+    let link = newElement("link")
+    link.add elem("linkclipref", &"clipitem-{id}")
+    link.add elem("mediatype", mediaType)
+    clipitem.add link
+
+proc resolveWriteAudio(audio: XmlNode, files: var FileDefs, tl: v3,
+    ptrToMi: Table[ptr string, MediaInfo], audioIds: ResolveAudioIds,
+    timebase: int64, ntsc: string) =
   for t, alayer in tl.a.pairs:
-    let track = newElement("track")
     let transitions = (if t < tl.at.len: tl.at[t] else: @[])
     let transitionLinks = transitionPlan(alayer, transitions)
-    for j, aclip in alayer.pairs:
-      if aclip.src == nil:
-        continue
-      if transitionLinks[j].incoming >= 0:
-        let transition = transitions[transitionLinks[j].incoming]
-        if transition.alignment == taStart:
-          track.add dissolveItem(transition, "audio", timebase, ntsc)
-      let mi = ptrToMi[aclip.src]
+    for sub, ids in audioIds[t]:
+      let track = newElement("track")
+      for j, aclip in alayer.pairs:
+        if ids[j] == 0:
+          continue
+        let mi = ptrToMi[aclip.src]
+        if transitionLinks[j].incoming >= 0:
+          let transition = transitions[transitionLinks[j].incoming]
+          if transition.alignment == taStart:
+            track.add dissolveItem(transition, "audio", timebase, ntsc)
 
-      var startVal = $aclip.start
-      var endVal = $(aclip.start + aclip.dur)
-      var inFrame = aclip.offset
-      var outFrame = aclip.offset + aclip.dur
-      if transitionLinks[j].incoming >= 0:
-        let transition = transitions[transitionLinks[j].incoming]
-        if transition.alignment == taCenter:
-          startVal = "-1"
-          inFrame = max(0'i64, inFrame - transition.dur div 2)
-        elif transition.alignment == taStart:
-          startVal = "-1"
-      if transitionLinks[j].outgoing >= 0:
-        let transition = transitions[transitionLinks[j].outgoing]
-        if transition.alignment == taCenter:
-          endVal = "-1"
-          outFrame += transition.dur - transition.dur div 2
-        elif transition.alignment == taEnd:
-          endVal = "-1"
-      let inVal = $inFrame
-      let outVal = $outFrame
+        var startVal = $aclip.start
+        var endVal = $(aclip.start + aclip.dur)
+        var inFrame = aclip.offset
+        var outFrame = aclip.offset + aclip.dur
+        if transitionLinks[j].incoming >= 0:
+          let transition = transitions[transitionLinks[j].incoming]
+          if transition.alignment == taCenter:
+            startVal = "-1"
+            inFrame = max(0'i64, inFrame - transition.dur div 2)
+          elif transition.alignment == taStart:
+            startVal = "-1"
+        if transitionLinks[j].outgoing >= 0:
+          let transition = transitions[transitionLinks[j].outgoing]
+          if transition.alignment == taCenter:
+            endVal = "-1"
+            outFrame += transition.dur - transition.dur div 2
+          elif transition.alignment == taEnd:
+            endVal = "-1"
+        let inVal = $inFrame
+        let outVal = $outFrame
 
-      nextId += 1
-      let clipItemNum = nextId
+        let clipitem = newElement("clipitem")
+        clipitem.attrs = {"id": &"clipitem-{ids[j]}"}.toXmlAttributes
+        clipitem.add elem("name", agSplitFile(mi.path).name)
+        clipitem.add elem("start", startVal)
+        clipitem.add elem("end", endVal)
+        clipitem.add elem("enabled", "TRUE")
+        clipitem.add elem("in", inVal)
+        clipitem.add elem("out", outVal)
+        clipitem.addTicks(tl.effects[aclip.effects], aclip, inFrame, outFrame, tl.tb, false)
 
-      let clipitem = newElement("clipitem")
-      clipitem.attrs = {"id": &"clipitem-{clipItemNum}"}.toXmlAttributes
-      clipitem.add elem("name", agSplitFile(mi.path).name)
-      clipitem.add elem("start", startVal)
-      clipitem.add elem("end", endVal)
-      clipitem.add elem("enabled", "TRUE")
-      clipitem.add elem("in", inVal)
-      clipitem.add elem("out", outVal)
+        files.makeFiledef(clipitem, mi, tl, timebase, ntsc)
 
-      files.makeFiledef(clipitem, mi, tl, timebase, ntsc)
+        let sourcetrack = newElement("sourcetrack")
+        sourcetrack.add elem("mediatype", "audio")
+        sourcetrack.add elem("trackindex", $(sub + 1))
+        clipitem.add sourcetrack
 
-      let sourcetrack = newElement("sourcetrack")
-      sourcetrack.add elem("mediatype", "audio")
-      # The clip's stream within its own file: after setStreamTo0 every
-      # track points at a single-stream wav, not the t-th stream of one file.
-      sourcetrack.add elem("trackindex", $(aclip.stream + 1))
-      clipitem.add sourcetrack
+        clipitem.addResolveLinks(tl, audioIds, j)
 
-      if mi.v.len > 0:
-        let link1 = newElement("link")
-        link1.add elem("linkclipref", &"clipitem-{j + 1}")
-        link1.add elem("mediatype", "video")
-        clipitem.add link1
-        let link2 = newElement("link")
-        link2.add elem("linkclipref", &"clipitem-{clipItemNum}")
-        clipitem.add link2
+        for f in clipFilters(tl.effects[aclip.effects], aclip, false, inFrame,
+            outFrame, aclip.dur, tl.tb.float64):
+          clipitem.add f
 
-      for f in clipFilters(tl.effects[aclip.effects], false, inFrame, outFrame,
-          aclip.dur, tl.tb.float64):
-        clipitem.add f
-
-      track.add clipitem
-      if transitionLinks[j].outgoing >= 0:
-        track.add dissolveItem(transitions[transitionLinks[j].outgoing],
-          "audio", timebase, ntsc)
-    audio.add track
+        track.add clipitem
+        if transitionLinks[j].outgoing >= 0:
+          track.add dissolveItem(transitions[transitionLinks[j].outgoing],
+            "audio", timebase, ntsc)
+      audio.add track
 
 type AudioTrackInfo = object
   layerIdx: int         # Index into tl.a
@@ -414,6 +480,7 @@ proc premiereWriteAudio(audio: XmlNode, files: var FileDefs, tl: v3,
       clipitem.add elem("end", endVal)
       clipitem.add elem("in", inVal)
       clipitem.add elem("out", outVal)
+      clipitem.addTicks(tl.effects[aclip.effects], aclip, inFrame, outFrame, tl.tb, false)
 
       files.makeFiledef(clipitem, src, tl, timebase, ntsc)
 
@@ -426,8 +493,8 @@ proc premiereWriteAudio(audio: XmlNode, files: var FileDefs, tl: v3,
       labels.add elem("label2", "Iris")
       clipitem.add labels
 
-      for f in clipFilters(tl.effects[aclip.effects], false, inFrame, outFrame,
-          aclip.dur, tl.tb.float64):
+      for f in clipFilters(tl.effects[aclip.effects], aclip, false, inFrame,
+          outFrame, aclip.dur, tl.tb.float64):
         clipitem.add f
 
       track.add clipitem
@@ -461,14 +528,42 @@ proc dissolveItem(t: Transition, mediaType: string, timebase: int64,
     of taCenter: "center"
     of taEnd: "end-black")
   let effect = newElement("effect")
-  let effectName = if mediaType == "video": "Cross Dissolve" else: "Cross Fade (0dB)"
+  # FCP7 XML can't name the other kinds; editors read them as a dissolve.
+  let effectName =
+    if mediaType != "video":
+      (if t.kind == tkConstantPower: "Cross Fade (+3dB)" else: "Cross Fade (0dB)")
+    else:
+      case t.kind
+      of tkDipToBlack, tkDipToWhite, tkDipToBlackLegacy, tkDipToWhiteLegacy:
+        "Dip to Color Dissolve"
+      of tkWipe: "Edge Wipe"
+      else: "Cross Dissolve"
   effect.add elem("name", effectName)
   effect.add elem("effectid", effectName)
   effect.add elem("effecttype", "transition")
   effect.add elem("mediatype", mediaType)
+  if effectName == "Edge Wipe":
+    effect.add elem("wipecode", "2")
+    effect.add elem("wipeaccuracy", "100")
   effect.add elem("startratio", "0")
   effect.add elem("endratio", "1")
   effect.add elem("reverse", "FALSE")
+  case effectName
+  of "Dip to Color Dissolve":
+    let white = t.kind in {tkDipToWhite, tkDipToWhiteLegacy}
+    let c = (if white: "255" else: "0")
+    let p = <>parameter(authoringApp = "PremierePro")
+    p.add elem("parameterid", "dipcolor")
+    p.add elem("name", "Color")
+    let value = newElement("value")
+    value.add elem("alpha", "255")
+    for ch in ["red", "green", "blue"]: value.add elem(ch, c)
+    p.add value
+    effect.add p
+  of "Edge Wipe":
+    # Wipe's default: from the left.
+    effect.add param("directionofwipe", "Angle", "90", "-360", "360")
+  else: discard
   result.add effect
 
 proc fcp7WriteXml*(name, output: string, resolve: bool, tl: v3) =
@@ -498,6 +593,7 @@ proc fcp7WriteXml*(name, output: string, resolve: bool, tl: v3) =
     nextVideoId += tl.v[k].len
   let firstAudioId = (if hasVideo: nextVideoId else: 1)
   let audioPlan = if resolve: @[] else: planPremiereAudio(tl, ptrToMi, firstAudioId)
+  let resolveAudio = if resolve: planResolveAudio(tl, ptrToMi) else: @[]
 
   let xmeml = <>xmeml(version = "5")
   let sequence = (if resolve: <>sequence() else: <>sequence(explodedTracks = "true"))
@@ -582,23 +678,20 @@ proc fcp7WriteXml*(name, output: string, resolve: bool, tl: v3) =
         clipitem.add elem("end", endVal)
         clipitem.add elem("in", inVal)
         clipitem.add elem("out", outVal)
+        if still: clipitem.addTicks(tl.effects[clip.effects], clip, 0, clip.dur, tl.tb, true)
+        else: clipitem.addTicks(tl.effects[clip.effects], clip, inFrame, outFrame, tl.tb, true)
 
         files.makeFiledef(clipitem, mi, tl, timebase, ntsc)
 
         clipitem.add elem("compositemode", "normal")
 
-        for f in clipFilters(tl.effects[clip.effects], true,
+        for f in clipFilters(tl.effects[clip.effects], clip, true,
             (if still: 0'i64 else: inFrame), (if still: clip.dur else: outFrame),
             clip.dur, tl.tb.float64):
           clipitem.add f
 
         if resolve:
-          let link1 = newElement("link")
-          link1.add elem("linkclipref", thisClipid)
-          clipitem.add link1
-          let link2 = newElement("link")
-          link2.add elem("linkclipref", &"clipitem-{tl.v[0].len + j + 1}")
-          clipitem.add link2
+          clipitem.addResolveLinks(tl, resolveAudio, j)
         elif vIdx == 0:
           # Base track: link the clip to itself and to its aligned audio clips so
           # they move together. Overlay tracks (v[1..]) carry no audio, so they
@@ -630,7 +723,7 @@ proc fcp7WriteXml*(name, output: string, resolve: bool, tl: v3) =
   # Audio definitions and clips
   let audio = newElement("audio")
   if resolve:
-    resolveWriteAudio(audio, files, tl, ptrToMi, timebase, ntsc)
+    resolveWriteAudio(audio, files, tl, ptrToMi, resolveAudio, timebase, ntsc)
   else:
     premiereWriteAudio(audio, files, tl, ptrToMi, audioPlan, timebase, ntsc)
 

@@ -450,12 +450,14 @@ proc gapNode(rate: float, dur: int64): JsonNode =
     "effects": newJArray(), "markers": newJArray(), "enabled": true
   }
 
-proc transitionNode(rate: float, t: Transition): JsonNode =
+proc transitionNode(rate: float, t: Transition, video: bool): JsonNode =
+  ## Premiere picks the transition by its MatchName; a video dissolve stays the
+  ## standard SMPTE one that every OTIO reader knows.
   let inOffset = case t.alignment
     of taStart: 0'i64
     of taCenter: t.dur div 2
     of taEnd: t.dur
-  %*{
+  result = %*{
     "OTIO_SCHEMA": "Transition.1",
     "metadata": newJObject(),
     "name": "Dissolve",
@@ -464,6 +466,16 @@ proc transitionNode(rate: float, t: Transition): JsonNode =
     "in_offset": rationalTime(rate, inOffset.float),
     "out_offset": rationalTime(rate, (t.dur - inOffset).float)
   }
+  # Premiere drops a transition whose match name it doesn't know, leaving a
+  # cut, so those it no longer reads go as a dissolve.
+  if (t.kind != tkDissolve and transitionInfo[t.kind].matchName != "") or not video:
+    let (name, matchName) =
+      if t.kind == tkDissolve: ("Constant Gain", "Constant Gain")
+      else: (transitionInfo[t.kind].name, transitionInfo[t.kind].matchName)
+    result["name"] = %name
+    if t.kind != tkCrossDissolveLegacy:
+      result["transition_type"] = %"Custom_Transition"
+    result["metadata"] = %*{"PremierePro_OTIO": {"MatchName": matchName}}
 
 proc otioWrite*(name, output: string, tl: v3) =
   let rate = tl.tb.num.float / tl.tb.den.float
@@ -525,7 +537,7 @@ proc otioWrite*(name, output: string, tl: v3) =
         let t = transitions[transitionLinks[j].incoming]
         if t.alignment == taStart:
           clipArr.add gapNode(rate, 0)
-          clipArr.add transitionNode(rate, t)
+          clipArr.add transitionNode(rate, t, true)
       if clip.start > cursor: clipArr.add gapNode(rate, clip.start - cursor)
       let actions = tl.effects[clip.effects]
       clipArr.add buildClip(clip, actions, ptrToMi[clip.src], rate, tb = tl.tb,
@@ -533,7 +545,7 @@ proc otioWrite*(name, output: string, tl: v3) =
       cursor = clip.start + clip.dur
       if transitionLinks[j].outgoing >= 0:
         let t = transitions[transitionLinks[j].outgoing]
-        clipArr.add transitionNode(rate, t)
+        clipArr.add transitionNode(rate, t, true)
         if t.alignment == taEnd:
           clipArr.add gapNode(rate, 0)
     if clipArr.len == 0:
@@ -563,7 +575,7 @@ proc otioWrite*(name, output: string, tl: v3) =
         let t = transitions[transitionLinks[j].incoming]
         if t.alignment == taStart:
           clipArr.add gapNode(rate, 0)
-          clipArr.add transitionNode(rate, t)
+          clipArr.add transitionNode(rate, t, false)
       if clip.start > cursor: clipArr.add gapNode(rate, clip.start - cursor)
       let actions = tl.effects[clip.effects]
       clipArr.add buildClip(clip, actions, ptrToMi[clip.src], rate, tb = tl.tb,
@@ -571,7 +583,7 @@ proc otioWrite*(name, output: string, tl: v3) =
       cursor = clip.start + clip.dur
       if transitionLinks[j].outgoing >= 0:
         let t = transitions[transitionLinks[j].outgoing]
-        clipArr.add transitionNode(rate, t)
+        clipArr.add transitionNode(rate, t, false)
         if t.alignment == taEnd:
           clipArr.add gapNode(rate, 0)
     children.add %*{

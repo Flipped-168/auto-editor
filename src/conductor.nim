@@ -7,7 +7,7 @@ import ./[av, action, edit, ffmpeg, license, log, media, stats, timeline]
 import ./lib/editutil
 import ./util/[color, bar, fun, lang, rules, rational]
 
-import ./imports/[fcp7, json]
+import ./imports/[fcp7, fcp11, json]
 import ./exports/[drops, fcp7, fcp11, json, shotcut, kdenlive, otio]
 import ./render/[format, subtitle]
 
@@ -392,15 +392,18 @@ proc applyLayers(tl: var v3, args: var mainArgs, interner: var StringInterner) =
         let a = max(clip.start, first)
         let b = min(clip.start + clip.dur, last)
         if b <= a: continue
-        if clip.effects notin groups:
+        # Offsets are in speed-scaled frames, so a trim of k output frames
+        # moves the offset by k; a speed ramp is cut down with the clip.
+        var part = tl.sliceClip(effectIndex, clip, a, b)
+        if part.effects notin groups:
           var acts: seq[Action]
-          for x in tl.effects[clip.effects]: acts.add x
+          for x in tl.effects[part.effects]: acts.add x
           acts.add own
-          groups[clip.effects] = tl.group(effectIndex, acts)
-        # Offsets are already in speed-scaled frames, so a trim of k output
-        # frames moves the offset by k.
-        track.add Clip(src: src, start: a, dur: b - a,
-          offset: clip.offset + (a - clip.start), effects: groups[clip.effects])
+          groups[part.effects] = tl.group(effectIndex, acts)
+        part.src = src
+        part.stream = 0
+        part.effects = groups[part.effects]
+        track.add part
     else:
       track.add Clip(src: src, start: first, dur: last - first, offset: first,
         effects: tl.group(effectIndex, own))
@@ -447,6 +450,11 @@ proc buildTimeline*(args: var mainArgs, audio: AudioSettings,
       tlV3 = fcp7ReadXml(input, interner)
       tlV3.applyArgs(args, audio)
       usePath = input
+    elif inputExt in [".fcpxml", ".fcpxmld"]:
+      tlV3 = fcp11ReadXml(input, interner)
+      tlV3.applyArgs(args, audio)
+      # A bundle names its output as the .fcpxml it holds.
+      usePath = input.changeFileExt(".fcpxml")
     else:
       usePath = input
       var tb = AVRational(num: 30, den: 1)
@@ -555,7 +563,7 @@ proc buildTimeline*(args: var mainArgs, audio: AudioSettings,
       applyLayers(tlV3, args, interner)
       tlV3.applyArgs(args, audio)
       if args.transition.getNumber > 0:
-        tlV3.addDissolveTransitions(
+        tlV3.addTransitions(args.transitionKind,
           toTb(args.transition, tlV3.tb.float).int64,
           toTb(args.transitionMinCut, tlV3.tb.float).int64)
       elif args.placedTransitions.len > 0:
