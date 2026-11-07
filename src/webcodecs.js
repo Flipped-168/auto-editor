@@ -59,21 +59,26 @@ addToLibrary({
         ];
         size = width * height + 2 * chromaWidth * chromaHeight;
       } else {
-        format = 'RGBA';
-        formatCode = 2;
-        layout = [{ offset: 0, stride: width * 4 }];
-        size = width * height * 4;
+        // Anything else (Firefox's BGRX, 10-bit, 4:2:2) has been converted
+        // or must be, so the samples are no longer the stream's own. Report
+        // the format without copying; C switches to FFmpeg's decoder.
+        const view = AEWebCodecs.ctrl(entry);
+        view[1] = 2;
+        view[2] = width;
+        view[3] = height;
+        view[4] = 0;
+        view[13] = 0;
+        AEWebCodecs.timestamp(view, frame.timestamp);
+        return true;
       }
       if (size > outCapacity) {
-        throw new RangeError('decoded video frame exceeds staging buffer');
+        AEWebCodecs.ctrl(entry)[13] = size;
+        return false;
       }
 
-      const copyOptions = format === 'RGBA'
-        ? { format, layout, rect }
-        : { layout, rect };
       await frame.copyTo(
         new Uint8Array(wasmMemory.buffer, outPtr, size),
-        copyOptions,
+        { layout, rect },
       );
       const view = AEWebCodecs.ctrl(entry);
       view[1] = formatCode;
@@ -88,6 +93,7 @@ addToLibrary({
       view[10] = layout[2]?.stride ?? 0;
       view[13] = size;
       AEWebCodecs.timestamp(view, frame.timestamp);
+      return true;
     },
 
     emitAudio: function(entry, sample, outPtr, outCapacity) {
@@ -96,7 +102,8 @@ addToLibrary({
       const planeSize = frames * 4;
       const size = planeSize * channels;
       if (size > outCapacity) {
-        throw new RangeError('decoded audio frame exceeds staging buffer');
+        AEWebCodecs.ctrl(entry)[13] = size;
+        return false;
       }
 
       for (let plane = 0; plane < channels; plane++) {
@@ -120,24 +127,29 @@ addToLibrary({
       view[14] = channels;
       view[15] = sample.sampleRate;
       AEWebCodecs.timestamp(view, sample.timestamp);
+      return true;
     },
 
     emitOne: async function(entry, outPtr, outCapacity) {
-      const sample = entry.outputs.shift();
+      const sample = entry.outputs[0];
       if (!sample) {
         AEWebCodecs.complete(entry, 2);
         return;
       }
+      let copied = false;
       try {
-        if (entry.kind !== 2) {
-          await AEWebCodecs.emitVideo(entry, sample, outPtr, outCapacity);
-        } else {
-          AEWebCodecs.emitAudio(entry, sample, outPtr, outCapacity);
-        }
-        AEWebCodecs.complete(entry, 1);
+        copied = entry.kind !== 2
+          ? await AEWebCodecs.emitVideo(entry, sample, outPtr, outCapacity)
+          : AEWebCodecs.emitAudio(entry, sample, outPtr, outCapacity);
       } finally {
-        sample.close();
+        if (copied) {
+          entry.outputs.shift();
+          sample.close();
+        }
       }
+      // A sample too large for the staging buffer stays queued; C grows the
+      // buffer to the reported size and pulls again.
+      AEWebCodecs.complete(entry, copied ? 1 : 4);
     },
 
     fail: function(entry, error) {
@@ -283,7 +295,11 @@ addToLibrary({
           bitDepth,
         );
         if (!codec) return 0;
-        if (kind === 1 && !(extraSize >= 4 && HEAPU8[extraPtr] === 1)) {
+        // Only avcC/hvcC records (configurationVersion 1) are descriptions;
+        // Annex B extradata means the stream is Annex B, which the browser
+        // decodes without one.
+        if ((kind === 1 || kind === 5)
+            && !(extraSize >= 4 && HEAPU8[extraPtr] === 1)) {
           description = undefined;
         } else if (kind === 3 || kind === 4 || kind === 6) {
           description = undefined;
@@ -310,9 +326,6 @@ addToLibrary({
             optimizeForLatency: true,
           }
         : { codec, sampleRate, numberOfChannels: channels, description };
-      if (kind === 1 || kind === 5) {
-        config.hardwareAcceleration = 'prefer-hardware';
-      }
       const supported = kind === 2
         ? await AudioDecoder.isConfigSupported(config)
         : await VideoDecoder.isConfigSupported(config);
