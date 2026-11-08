@@ -17,7 +17,7 @@ type
     modern, classic, ascii, machine, none
   ExportKind* = enum
     exAuto, exDefault, exClipSequence, exV1, exV2, exV3, exPremiere, exResolveFcp7,
-    exFinalCutPro, exResolve, exShotcut, exKdenlive, exPremiereOtio
+    exFinalCutPro, exResolve, exShotcut, exKdenlive, exPremiereOtio, exEdl
   ExportSpec* = object
     kind*: ExportKind
     name*: string
@@ -40,6 +40,7 @@ func `$`*(kind: ExportKind): string {.raises: [].} =
   of exShotcut: "shotcut"
   of exKdenlive: "kdenlive"
   of exPremiereOtio: "premiere-otio"
+  of exEdl: "edl"
 
 func pack*(flag: bool, number: int64): PackedInt {.raises: [].} =
   let maskedNumber = number and 0x7FFFFFFFFFFFFFFF'i64
@@ -101,12 +102,12 @@ type AddSpec* = object
   path*: string
   generator*: string # `add:confetti...`: the action painting a source-less
                      # layer, instead of a file to overlay. `path` is empty.
-  hasPos*: bool # whether x:y:scale were given (else origin, native size)
   xKf*, yKf*, scaleKf*: seq[float32] # placement ramps (len 1 = static), fed to pos
-  followBase*: bool = true # mirror the base clip's offset (stay time-synced) vs.
-                             # restart from frame 0 each kept section (logo/gif use)
   effects*: string # actions chained after `add:` — applied to this overlay
                      # layer (not the base), as a comma-separated atf-8 string
+  hasPos*: bool # whether x:y:scale were given (else origin, native size)
+  followBase*: bool = true # mirror the base clip's offset (stay time-synced) vs.
+                             # restart from frame 0 each kept section (logo/gif use)
 
 type PlacedTransition* = object
   ## A transition an editor placed on a linear edit, in output frames; the
@@ -117,6 +118,7 @@ type PlacedTransition* = object
   align*: int
   video*: bool
   kind*: TransitionKind
+  easeIn*, easeOut*: float32 = defaultEase
 
 type VideoSettings* = object
   codec*: string = "auto"
@@ -154,11 +156,9 @@ type mainArgs* = object
     kind: exAuto, name: "Auto-Editor Media Group", version: 11)
   output*: string = ""
   setAction*: seq[(Actions, PackedInt, PackedInt)]
-  setActionConcat*: bool # library-only: setAction frames run across the inputs end to end
   adds*: seq[AddSpec]                             # `add:` overlays (see AddSpec)
   layers*: seq[LayerSpec]                         # library-only overlays
   transition*: PackedInt = pack(false, 0) # 0 disables; otherwise its duration
-  transitionKind*: TransitionKind
   transitionMinCut*: PackedInt = pack(true, 1000) # 1 second
   placedTransitions*: seq[PlacedTransition] # library-only: chosen in an editor
 
@@ -166,19 +166,23 @@ type mainArgs* = object
   ytDlpLocation*: string = "yt-dlp"
   outputFormat*: string
   ytDlpExtras*: string
-  urlInput*: bool = false
 
   # Timeline Options
-  resolution*: (int32, int32) = (0, 0)
-  resolutionSet*: bool = false
-  sampleRate*: cint = -1
   frameRate*: AVRational = AVRational(num: 0, den: 0)
-  background*: Option[RGBColor] = none(RGBColor)
-  progress*: BarType = modern
 
   # Licensing
   licenseKey*: string # -k/--license-key; gates paid features (see license.nim)
+
+  # Fields narrower than a pointer, together so alignment adds no padding
+  resolution*: (int32, int32) = (0, 0)
+  sampleRate*: cint = -1
   flags: uint32
+  background*: Option[RGBColor] = none(RGBColor)
+  progress*: BarType = modern
+  transitionKind*: TransitionKind
+  setActionConcat*: bool # library-only: setAction frames run across the inputs end to end
+  resolutionSet*: bool = false
+  urlInput*: bool = false
 
 genFlagInterface(mainArgs)
 

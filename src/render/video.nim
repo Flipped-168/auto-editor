@@ -16,16 +16,16 @@ type VideoFrame = object
   index: int
   src: ptr string
   effects: Actions
-  gen: bool      # source-less overlay (`add:confetti`): draw on a clear canvas
   local: int     # frame offset within the clip, for animated effects
   srcSecs: float
   dur: int       # clip length in frames
+  layer: int
+  win: int = -1  # the layer's transition window it is in, if any
   x: float32     # overlay placement (canvas pixels, sub-pixel); 0 for the base layer
   y: float32
   scale: float32 # overlay size multiplier; 1.0 for the base layer
+  gen: bool      # source-less overlay (`add:confetti`): draw on a clear canvas
   fit: bool      # no explicit `pos`: fit-and-center to the canvas like the base
-  layer: int
-  win: int = -1  # the layer's transition window it is in, if any
   incoming: bool # in its window, the clip coming in rather than going out
 
 # Identity of a configured effect filter graph: everything that determines the
@@ -205,7 +205,6 @@ type
     ## timeline frame needs it at two places, as across a dissolve, so neither
     ## place makes the other seek back to a keyframe every frame.
     cn: InputContainer
-    ownsCn: bool                # opened for this decoder, not the media cache's
     decoder: ptr AVCodecContext
     held: ptr AVFrame           # last decoded frame, held for forward reuse
     frameIndex: int             # current source position; -1 = none yet
@@ -214,8 +213,9 @@ type
     lastSeekTarget: int         # -1 = no seek performed yet
     lastReqIndex: int           # last obj.index requested (held-frame reuse)
     loopBase: int               # source frames consumed by completed loops
-    hasSeekFrame: bool          # whether seekFrame holds a pending marker
     usedAt: int64               # timeline frame it last decoded for; -1 = never
+    ownsCn: bool                # opened for this decoder, not the media cache's
+    hasSeekFrame: bool          # whether seekFrame holds a pending marker
 
   SrcState = ref object
     kfFrames: seq[int]          # indexed keyframe frame numbers
@@ -1014,12 +1014,6 @@ proc makeNewVideoFrames*(output: var OutputContainer, tl: v3, args: mainArgs,
     if sar.isValid:
       encoderCtx.sample_aspect_ratio = sar
 
-  # The format frames will arrive in, or NONE when the timeline carries no video
-  # source at all and every frame is synthesized.
-  let srcPixFmt =
-    if firstSrc != nil: AVPixelFormat(myCache.cns[firstSrc].video[0].codecpar.format)
-    else: AV_PIX_FMT_NONE
-
   if video.bitrate >= 0:
     encoderCtx.bit_rate = video.bitrate
     debug(&"video bitrate: {encoderCtx.bit_rate}")
@@ -1153,14 +1147,14 @@ proc makeNewVideoFrames*(output: var OutputContainer, tl: v3, args: mainArgs,
       error "Failed to allocate proxy scale sws context"
     discard av_opt_set_int(scaleCtx, "threads", 0, 0)
 
-  # Create a persistent sws context for the per-frame pixel format conversion.
-  # Reusing it avoids the per-frame alloc/init overhead of the new sws API.
-  var reformatCtx: ptr SwsContext = nil
-  if pix_fmt != srcPixFmt:
-    reformatCtx = sws_alloc_context()
-    if reformatCtx == nil:
-      error "Failed to allocate reformat sws context"
-    discard av_opt_set_int(reformatCtx, "threads", 0, 0)
+  # One sws context for the per-frame pixel format conversion. It is kept
+  # even when the stream's format matches the output: a decoder may still
+  # hand back another layout (a browser's NV12 for a yuv420p stream), and
+  # swscale only initializes the context on the first frame that needs it.
+  var reformatCtx = sws_alloc_context()
+  if reformatCtx == nil:
+    error "Failed to allocate reformat sws context"
+  discard av_opt_set_int(reformatCtx, "threads", 0, 0)
 
   # Allocated on the first zoom; swscale rebuilds it itself when the geometry
   # changes, so a constant zoom pays the init cost once.
@@ -2301,7 +2295,7 @@ proc makeNewVideoFrames*(output: var OutputContainer, tl: v3, args: mainArgs,
           let dip: tuple[r, g, b: float32] = (tl.bg.red.float32, tl.bg.green.float32,
             tl.bg.blue.float32)
           let img = render(w.kind, fromF.toImg, toF.toImg, below.toImg, p,
-            local.int, w.dur.int, seed, dip)
+            local.int, w.dur.int, seed, dip, w.easeIn, w.easeOut)
           acc = img.fromImg(fromF)
           av_frame_free(addr fromF)
           av_frame_free(addr toF)

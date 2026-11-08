@@ -1,4 +1,4 @@
-import std/[strformat, strutils, tables]
+import std/[algorithm, strformat, strutils, tables]
 from std/math import ceil, round
 import ../util/xml
 
@@ -119,13 +119,29 @@ func fcpLang(lang: Lang): string {.raises: [].} =
   of "tur": "tr"
   else: $lang # a three-letter tag is itself a language subtag
 
-proc anchorCaptions(asset: XmlNode, tl: v3, clip: Clip, startPoint: int64,
-    lo, hi: int64, styleId: var int) {.raises: [].} =
+type CueOrder = seq[(int64, int)] # each cue's start and index, by start
+
+func cueOrders(tl: v3): seq[CueOrder] {.raises: [].} =
+  ## Cues needn't be sorted, so search a sorted index of each track's.
+  for track in tl.c:
+    var order = newSeq[(int64, int)](track.cues.len)
+    for i, cue in track.cues: order[i] = (cue.start, i)
+    order.sort()
+    result.add order
+
+proc anchorCaptions(asset: XmlNode, tl: v3, orders: seq[CueOrder], clip: Clip,
+    startPoint: int64, lo, hi: int64, styleId: var int) {.raises: [].} =
   ## The cues starting in timeline frames [lo, hi), connected to `asset`, the
   ## clip they start during. A cue before the clip is clipped to its start.
   for t, track in tl.c:
-    for cue in track.cues:
-      if cue.start < lo or cue.start >= hi: continue
+    var hits: seq[int]
+    var k = orders[t].lowerBound((lo, 0))
+    while k < orders[t].len and orders[t][k][0] < hi:
+      hits.add orders[t][k][1]
+      inc k
+    hits.sort() # in track order
+    for i in hits:
+      template cue: Caption = track.cues[i]
       let start = max(cue.start, clip.start)
       let dur = cue.start + cue.dur - start
       if dur <= 0: continue
@@ -183,7 +199,9 @@ proc makeClip(spine: XmlNode, tl: v3, sources: seq[MediaInfo],
   let map = initSpeedMap(effectGroup)
   if map.mean != 1.0 or map.ramp:
     let timemap = newElement("timeMap")
-    proc point(time: int64, value: float64, interp: string) {.raises: [].} =
+    # A template, not a closure: capturing `tl` would copy the whole
+    # timeline on every call.
+    template point(time: int64, value: float64, interp: string) =
       let p = newElement("timept")
       p.attrs = {"time": fraction(time, tl.tb), "value": mediaFraction(value, tl.tb),
         "interp": interp}.toXmlAttributes
@@ -320,6 +338,7 @@ proc fcp11WriteXml*(groupName: string, version: uint8, output: string,
           discard spine.makeClip(tl, sources, ptrToIdx, projName, srcDur, clip)
 
   let plan = transitionPlan(clips, transitions)
+  let orders = cueOrders(tl)
   var styleId = 0
   for i, clip in clips:
     if clip.src != nil:
@@ -335,11 +354,11 @@ proc fcp11WriteXml*(groupName: string, version: uint8, output: string,
       # those clips' too.
       let lo = (if i == 0: 0'i64 else: clip.start)
       var hi = high(int64)
-      for later in clips[i + 1 .. ^1]:
-        if later.src != nil:
-          hi = later.start
+      for j in i + 1 ..< clips.len:
+        if clips[j].src != nil:
+          hi = clips[j].start
           break
-      asset.anchorCaptions(tl, clip, startPoint, lo, hi, styleId)
+      asset.anchorCaptions(tl, orders, clip, startPoint, lo, hi, styleId)
       if plan[i].outgoing >= 0:
         spine.addTransition(tl, dissolveId, transitions[plan[i].outgoing])
 

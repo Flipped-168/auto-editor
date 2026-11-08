@@ -4,14 +4,14 @@ import ffmpeg
 import util/rational
 
 type AudioResampler* = object
-  graph*: ptr AVFilterGraph
   layout: AVChannelLayout
+  templateLayout: AVChannelLayout
+  graph*: ptr AVFilterGraph
   abuffer: ptr AVFilterContext
   abuffersink: ptr AVFilterContext
   frameSize: cint
   templateFormat: cint
   templateRate: cint
-  templateLayout: AVChannelLayout
   format: cint
   rate: cint
   isPassthrough: bool
@@ -111,6 +111,9 @@ proc resample*(resampler: var AudioResampler, frame: ptr AVFrame): seq[ptr AVFra
     resampler.graph = avfilter_graph_alloc()
     if resampler.graph == nil:
       error "Could not allocate filter graph"
+    # Sample conversion gains nothing from slice threads, and the default
+    # pool starts a thread per core for every graph.
+    resampler.graph.nb_threads = 1
 
     let abuffer = avfilter_get_by_name("abuffer")
     let aformat = avfilter_get_by_name("aformat")
