@@ -12,8 +12,9 @@ type
     actSpeed,
     # Can add 3 more [VA] actions
     actVolume = 4,
-    actDeesser, actDuck, actPitch, actTone, actConvolve,
-    # Can add 10 more [A] actions
+    actDeesser, actDuck, actPitch, actTone, actConvolve, actHighpass, actLowpass,
+    actDehum,
+    # Can add 7 more [A] actions
     actInvert = 20,
     actHflip, actVflip, actZoom, actOpacity, actBlur, actBrightness, actLuv, actLens,
     actRotate, actSpin, actDrawbox, actPos, actColorKey, actChromaKey, actLoop,
@@ -97,6 +98,11 @@ type
       kt*: seq[KfTime]       # each keyframe's time, or empty: spread evenly
     of actDeesser:
       intensity*, maxd*, freq*: Unorm16
+    of actHighpass, actLowpass:
+      cutoff*: uint16        # Hz
+    of actDehum:
+      humHz*: uint16         # the mains frequency
+      humHarmonics*: uint8   # notches at humHz and its multiples, this many
     of actPitch:
       # Semitones x 100. Cent buckets round-trip as exact decimal semitones
       pCents*: int16
@@ -233,6 +239,12 @@ Keyframes can also say when they are, as `value@time`: a bare frame count, `sec`
     help: """
 Reduce harsh "s" and "sh" sibilance in the section. Implemented via ffmpeg's `deesser` filter.
 Positional args: `intensity` sets how much to de-ess (0.0 = none, 1.0 = maximum), `max` caps the reduction (default 0.5), and `freq` sets the split frequency (default 0.5)."""),
+  ActionDef(name: "highpass", flags: {afAudio}, argSpec: "[hz]", range: rng(10.0, 20000.0),
+    help: "Cut the lows below `hz` (default 80), such as rumble, wind and handling noise under speech. A 12 dB per octave Butterworth filter; chain two for a steeper slope."),
+  ActionDef(name: "lowpass", flags: {afAudio}, argSpec: "[hz]", range: rng(10.0, 20000.0),
+    help: "Cut the highs above `hz` (default 10000), such as hiss. A 12 dB per octave Butterworth filter; chain two for a steeper slope."),
+  ActionDef(name: "dehum", flags: {afAudio}, argSpec: "[hz[:harmonics]]",
+    help: "Remove mains hum: a narrow notch at `hz` (default 60; use 50 where the mains is 50 Hz) and at each of its first `harmonics` multiples (default 4, up to 16)."),
   ActionDef(name: "duck", flags: {afAudio}, argSpec: "[amount[:threshold[:attack[:release]]]]",
     help: """
 Autoduck (sidechain): lower this clip's audio wherever the louder audio layers beneath it (higher track indices) are active, e.g. tuck a music/desktop track under a voice track. Cross-track, so it is applied when the audio layers are mixed; a no-op on the bottom-most layer and on single-layer audio.
@@ -909,6 +921,26 @@ func parseAction*(val: string): Action {.raises: [ActionParseError].} =
       vals[idx - 1] = toUnorm16(pFloat(parts[idx]))
     return Action(kind: actDeesser, intensity: vals[0], maxd: vals[1], freq: vals[2])
 
+  if parts[0] in ["highpass", "lowpass"] and parts.len <= 2:
+    var hz = (if parts[0] == "highpass": 80.0'f32 else: 10000.0'f32)
+    if parts.len == 2: hz = pFloat(parts[1])
+    if not (hz >= 10.0 and hz <= 20000.0):
+      raise newException(ActionParseError, &"{parts[0]} must be in [10, 20000] Hz")
+    let cutoff = uint16(round(hz))
+    return (if parts[0] == "highpass": Action(kind: actHighpass, cutoff: cutoff)
+      else: Action(kind: actLowpass, cutoff: cutoff))
+
+  if parts[0] == "dehum" and parts.len <= 3:
+    var hz = 60.0'f32
+    var n = 4.0'f32
+    if parts.len >= 2: hz = pFloat(parts[1])
+    if parts.len == 3: n = pFloat(parts[2])
+    if not (hz >= 20.0 and hz <= 1000.0):
+      raise newException(ActionParseError, "dehum must be in [20, 1000] Hz")
+    if not (n >= 1.0 and n <= 16.0 and n == round(n)):
+      raise newException(ActionParseError, "dehum harmonics must be a whole number in [1, 16]")
+    return Action(kind: actDehum, humHz: uint16(round(hz)), humHarmonics: uint8(n))
+
   # duck takes positional args: [amount[:threshold[:attack[:release]]]]
   if parts[0] == "duck" and parts.len <= 5:
     var vals = [0.85'f32, 0.04'f32, 100.0'f32, 500.0'f32]
@@ -1370,6 +1402,9 @@ when not defined(nimscript):
         &"{name}:{rampStr(parts, act.sKt)}{easeSuffix(act)}"
     of actVolume: &"volume:{kfStr(act)}{easeSuffix(act)}"
     of actDeesser: &"deesser:{act.intensity}:{act.maxd}:{act.freq}"
+    of actHighpass: &"highpass:{act.cutoff}"
+    of actLowpass: &"lowpass:{act.cutoff}"
+    of actDehum: &"dehum:{act.humHz}:{act.humHarmonics}"
     of actPitch: &"pitch:{act.pCents.float32 / 100.0'f32}"
     of actTone:
       if act.wave == wSine: &"tone:{act.note}"
@@ -1503,7 +1538,8 @@ when not defined(nimscript):
     case a.kind
     of actInvert, actHflip, actVflip, actLoop, actErosion: 1
     of actChoke: 2
-    of actRotate, actPitch, actTone: 3
+    of actRotate, actPitch, actTone, actHighpass, actLowpass: 3
+    of actDehum: 4
     of actLens: 5
     of actSpeed:
       if a.sKf.len == 0: 5
@@ -1541,273 +1577,287 @@ when not defined(nimscript):
     let base = cast[ptr UncheckedArray[uint8]](int(a) + sizeof(uint16))
     (base[0] and 0x7f'u8).int == ord(actLoop)
 
+  proc decodeAt(base: ptr UncheckedArray[uint8], i: var int): Action =
+    # The bytes come from our own pack (newActions), so the kind byte is
+    # always a declared ActionKind despite the enum's reserved holes.
+    {.push warning[HoleEnumConv]: off.}
+    let kind = ActionKind((base[i] and 0x7f'u8).int)
+    {.pop.}
+    case kind
+    of actInvert, actHflip, actVflip, actLoop, actErosion:
+      result = Action(kind: kind)
+      i += 1
+    of actRotate:
+      var st: Unorm16
+      copyMem(addr st, addr base[i + 1], sizeof(Unorm16))
+      result = Action(kind: actRotate, rStart: st)
+      i += 3
+    of actScale:
+      var w, h: float32
+      copyMem(addr w, addr base[i + 1], sizeof(float32))
+      copyMem(addr h, addr base[i + 5], sizeof(float32))
+      result = Action(kind: actScale, tScaleW: w, tScaleH: h, tUniform: base[i + 9] != 0)
+      i += 10
+    of actTurn:
+      var v: float32
+      copyMem(addr v, addr base[i + 1], sizeof(float32))
+      result = Action(kind: actTurn, tDeg: v)
+      i += 5
+    of actPitch:
+      var cents: int16
+      copyMem(addr cents, addr base[i + 1], sizeof(int16))
+      result = Action(kind: actPitch, pCents: cents)
+      i += 3
+    of actTone:
+      result = Action(kind: actTone, note: base[i + 1],
+        wave: Waveform(base[i + 2].int))
+      i += 3
+    of actLens:
+      var k1v, k2v: Snorm16
+      copyMem(addr k1v, addr base[i + 1], sizeof(Snorm16))
+      copyMem(addr k2v, addr base[i + 3], sizeof(Snorm16))
+      result = Action(kind: actLens, k1: k1v, k2: k2v)
+      i += 5
+    of actSpeed:
+      var v: float32
+      copyMem(addr v, addr base[i + 1], sizeof(float32))
+      var act = Action(kind: actSpeed, val: v,
+        varispeed: (base[i] and varispeedFlag) != 0'u8)
+      var pos = i + 5
+      # A ramp stores its mean negated, then its easing and keyframes.
+      if v < 0:
+        act.val = -v
+        act.hasEase = base[pos] != 0'u8
+        pos += 1
+        if act.hasEase:
+          act.easeCurve = Easing(base[pos].int)
+          pos += 1
+        let (count, timed) = unpackCount(base, pos)
+        act.sKf = newSeq[float32](count)
+        for c in 0 ..< count:
+          copyMem(addr act.sKf[c], addr base[pos], sizeof(float32))
+          pos += 4
+        if timed: act.sKt = unpackTimes(base, pos, count)
+      result = act
+      i = pos
+    of actDeesser:
+      var iu, mu, fu: Unorm16
+      copyMem(addr iu, addr base[i + 1], sizeof(Unorm16))
+      copyMem(addr mu, addr base[i + 3], sizeof(Unorm16))
+      copyMem(addr fu, addr base[i + 5], sizeof(Unorm16))
+      result = Action(kind: actDeesser, intensity: iu, maxd: mu, freq: fu)
+      i += 7
+    of actHighpass, actLowpass:
+      var hz: uint16
+      copyMem(addr hz, addr base[i + 1], sizeof(uint16))
+      result = (if kind == actHighpass: Action(kind: actHighpass, cutoff: hz)
+        else: Action(kind: actLowpass, cutoff: hz))
+      i += 3
+    of actDehum:
+      var hz: uint16
+      copyMem(addr hz, addr base[i + 1], sizeof(uint16))
+      result = Action(kind: actDehum, humHz: hz, humHarmonics: base[i + 3])
+      i += 4
+    of actDuck:
+      var amt, thr: Unorm16
+      var atk, rel: uint16
+      copyMem(addr amt, addr base[i + 1], sizeof(Unorm16))
+      copyMem(addr thr, addr base[i + 3], sizeof(Unorm16))
+      copyMem(addr atk, addr base[i + 5], sizeof(uint16))
+      copyMem(addr rel, addr base[i + 7], sizeof(uint16))
+      result = Action(kind: actDuck, duckAmount: amt, duckThresh: thr,
+        duckAttack: atk, duckRelease: rel)
+      i += 9
+    of actConvolve:
+      var n: uint16
+      copyMem(addr n, addr base[i + 1], sizeof(uint16))
+      var path = newString(n.int)
+      if n > 0: copyMem(addr path[0], addr base[i + 3], n.int)
+      result = Action(kind: actConvolve, irPath: path)
+      i += 3 + n.int
+    of actBurn, actText:
+      var act = if kind == actText: Action(kind: actText) else: Action(kind: actBurn)
+      act.burnVertical = (base[i] and verticalFlag) != 0'u8
+      var pos = i + 1
+      for path in [addr act.burnFile, addr act.burnFont]:
+        var n: uint16
+        copyMem(addr n, addr base[pos], sizeof(uint16))
+        path[] = newString(n.int)
+        if n > 0: copyMem(addr path[][0], addr base[pos + 2], n.int)
+        pos += 2 + n.int
+      copyMem(addr act.burnSize, addr base[pos], sizeof(float32))
+      act.burnSet = cast[set[BurnPart]](base[pos + 4])
+      act.burnAlign = base[pos + 5]
+      copyMem(addr act.burnColors, addr base[pos + 6], 12)
+      result = act
+      i = pos + 18
+    of actSpin:
+      var st: Unorm16
+      var rate: float32
+      copyMem(addr st, addr base[i + 1], sizeof(Unorm16))
+      copyMem(addr rate, addr base[i + 3], sizeof(float32))
+      result = Action(kind: actSpin, sStart: st, sRate: rate)
+      i += 7
+    of actColorKey, actChromaKey:
+      let col = RGBColor(red: base[i + 1], green: base[i + 2], blue: base[i + 3],
+        yuv: (base[i] and yuvFlag) != 0'u8)
+      var sim, blend: Unorm16
+      copyMem(addr sim, addr base[i + 4], sizeof(Unorm16))
+      copyMem(addr blend, addr base[i + 6], sizeof(Unorm16))
+      result = Action(kind: kind, color: col, similar: sim, blend: blend)
+      i += 8
+    of actChoke:
+      result = Action(kind: actChoke, chokeN: base[i + 1])
+      i += 2
+    of actMask, actConfine:
+      let flags = base[i + 1]
+      let feather = base[i + 2]
+      var x, y, w, h, radius: int32
+      copyMem(addr x, addr base[i + 3], sizeof(int32))
+      copyMem(addr y, addr base[i + 7], sizeof(int32))
+      copyMem(addr w, addr base[i + 11], sizeof(int32))
+      copyMem(addr h, addr base[i + 15], sizeof(int32))
+      copyMem(addr radius, addr base[i + 19], sizeof(int32))
+      result = Action(kind: kind, mRadius: radius,
+        mReset: (flags and 0x2'u8) != 0, mInvert: (flags and 0x1'u8) != 0,
+        mFeather: feather, mX: x, mY: y, mW: w, mH: h)
+      i += 23
+    of actMaskPoly, actConfinePoly:
+      let invert = (base[i + 1] and 0x1'u8) != 0'u8
+      let feather = base[i + 2]
+      var n: uint16
+      copyMem(addr n, addr base[i + 3], sizeof(uint16))
+      var xs = newSeq[int32](n.int)
+      var ys = newSeq[int32](n.int)
+      var pos = i + 5
+      for k in 0 ..< n.int:
+        copyMem(addr xs[k], addr base[pos], sizeof(int32))
+        copyMem(addr ys[k], addr base[pos + 4], sizeof(int32))
+        pos += 8
+      result = Action(kind: kind, mFeather: feather, mInvert: invert,
+        mPolyXs: xs, mPolyYs: ys)
+      i = pos
+    of actPixelate:
+      let hasEase = (base[i] and easeFlag) != 0'u8
+      var pos = i + 1
+      var act = Action(kind: actPixelate, hasEase: hasEase)
+      if hasEase:
+        act.easeCurve = Easing(base[pos].int)
+        act.easeDurUnit = DurUnit(base[pos + 1].int)
+        copyMem(addr act.easeDur, addr base[pos + 2], sizeof(float32))
+        pos += 6
+      for which in 0 .. 1:  # width, then height keyframes
+        let (count, timed) = unpackCount(base, pos)
+        var sizes = newSeq[float32](count)
+        for c in 0 ..< count:
+          var v: uint16
+          copyMem(addr v, addr base[pos], sizeof(uint16))
+          sizes[c] = v.float32
+          pos += 2
+        let times = (if timed: unpackTimes(base, pos, count) else: @[])
+        if which == 0: (act.pixWKf, act.pixWKt) = (sizes, times)
+        else: (act.pixHKf, act.pixHKt) = (sizes, times)
+      result = act
+      i = pos
+    of actConfetti:
+      var count, seed: uint16
+      var gravity: float32
+      copyMem(addr count, addr base[i + 1], sizeof(uint16))
+      copyMem(addr gravity, addr base[i + 3], sizeof(float32))
+      copyMem(addr seed, addr base[i + 8], sizeof(uint16))
+      let flags = base[i + 7]
+      result = Action(kind: actConfetti, cCount: count, cGravity: gravity,
+        cScheme: ConfettiScheme((flags and schemeMask).int),
+        cShimmer: (flags and shimmerFlag) != 0'u8,
+        cOrigin: ConfettiOrigin(((flags shr originShift) and originMask).int),
+        cSeed: seed)
+      i += 10
+    of actAberration:
+      result = Action(kind: actAberration,
+        abRh: cast[int8](base[i + 1]), abRv: cast[int8](base[i + 2]),
+        abGh: cast[int8](base[i + 3]), abGv: cast[int8](base[i + 4]),
+        abBh: cast[int8](base[i + 5]), abBv: cast[int8](base[i + 6]),
+        abWrap: base[i + 7] != 0'u8)
+      i += 8
+    of actLuv:
+      var bh: Snorm16
+      var c, s: float32
+      copyMem(addr bh, addr base[i + 1], sizeof(Snorm16))
+      copyMem(addr c, addr base[i + 3], sizeof(float32))
+      copyMem(addr s, addr base[i + 7], sizeof(float32))
+      result = Action(kind: actLuv, brighthue: bh, contrast: c, saturation: s)
+      i += 11
+    of actPos:
+      let hasEase = (base[i] and easeFlag) != 0'u8
+      var pos = i + 1
+      var act = Action(kind: actPos, hasEase: hasEase)
+      if hasEase:
+        act.easeCurve = Easing(base[pos].int)
+        act.easeDurUnit = DurUnit(base[pos + 1].int)
+        copyMem(addr act.easeDur, addr base[pos + 2], sizeof(float32))
+        pos += 6
+      for which in 0 .. 2:  # x, y, scale keyframe seqs in order
+        let (count, timed) = unpackCount(base, pos)
+        var s = newSeq[float32](count)
+        for c in 0 ..< count:
+          copyMem(addr s[c], addr base[pos], sizeof(float32))
+          pos += 4
+        let times = (if timed: unpackTimes(base, pos, count) else: @[])
+        case which
+        of 0: (act.pxKf, act.pxKt) = (s, times)
+        of 1: (act.pyKf, act.pyKt) = (s, times)
+        else: (act.pscaleKf, act.pscaleKt) = (s, times)
+      result = act
+      i = pos
+    of actDrawbox:
+      var x, y, w, h: int32
+      copyMem(addr x, addr base[i + 1], sizeof(int32))
+      copyMem(addr y, addr base[i + 5], sizeof(int32))
+      copyMem(addr w, addr base[i + 9], sizeof(int32))
+      copyMem(addr h, addr base[i + 13], sizeof(int32))
+      let col = RGBColor(red: base[i + 17], green: base[i + 18], blue: base[i + 19],
+        yuv: (base[i] and yuvFlag) != 0'u8)
+      result = Action(kind: actDrawbox, dbX: x, dbY: y, dbW: w, dbH: h, dbColor: col)
+      i += 20
+    of actZoom, actBlur, actOpacity, actBrightness, actVolume:
+      let hasEase = (base[i] and easeFlag) != 0'u8
+      var pos = i + 1
+      var act = Action(kind: kind)
+      act.hasEase = hasEase
+      if hasEase:
+        act.easeCurve = Easing(base[pos].int)
+        act.easeDurUnit = DurUnit(base[pos + 1].int)
+        copyMem(addr act.easeDur, addr base[pos + 2], sizeof(float32))
+        pos += 6
+      let (count, timed) = unpackCount(base, pos)
+      act.kf = newSeq[float32](count)
+      for c in 0 ..< count:
+        if kind in {actZoom, actBlur, actVolume}:
+          var v: float32
+          copyMem(addr v, addr base[pos], sizeof(float32))
+          act.kf[c] = v
+          pos += 4
+        elif kind == actOpacity:
+          var u: Unorm16
+          copyMem(addr u, addr base[pos], sizeof(Unorm16))
+          act.kf[c] = u.toFloat32
+          pos += 2
+        else:
+          var s: Snorm16
+          copyMem(addr s, addr base[pos], sizeof(Snorm16))
+          act.kf[c] = s.toFloat32
+          pos += 2
+      if timed: act.kt = unpackTimes(base, pos, count)
+      result = act
+      i = pos
+
   iterator items*(a: Actions): Action =
     if int(a) > 1:
       let n = a.len
       let base = cast[ptr UncheckedArray[uint8]](int(a) + sizeof(uint16))
       var i = 0
       while i < n:
-        # The bytes come from our own pack (newActions), so the kind byte is
-        # always a declared ActionKind despite the enum's reserved holes.
-        {.push warning[HoleEnumConv]: off.}
-        let kind = ActionKind((base[i] and 0x7f'u8).int)
-        {.pop.}
-        case kind
-        of actInvert, actHflip, actVflip, actLoop, actErosion:
-          yield Action(kind: kind)
-          i += 1
-        of actRotate:
-          var st: Unorm16
-          copyMem(addr st, addr base[i + 1], sizeof(Unorm16))
-          yield Action(kind: actRotate, rStart: st)
-          i += 3
-        of actScale:
-          var w, h: float32
-          copyMem(addr w, addr base[i + 1], sizeof(float32))
-          copyMem(addr h, addr base[i + 5], sizeof(float32))
-          yield Action(kind: actScale, tScaleW: w, tScaleH: h, tUniform: base[i + 9] != 0)
-          i += 10
-        of actTurn:
-          var v: float32
-          copyMem(addr v, addr base[i + 1], sizeof(float32))
-          yield Action(kind: actTurn, tDeg: v)
-          i += 5
-        of actPitch:
-          var cents: int16
-          copyMem(addr cents, addr base[i + 1], sizeof(int16))
-          yield Action(kind: actPitch, pCents: cents)
-          i += 3
-        of actTone:
-          yield Action(kind: actTone, note: base[i + 1],
-            wave: Waveform(base[i + 2].int))
-          i += 3
-        of actLens:
-          var k1v, k2v: Snorm16
-          copyMem(addr k1v, addr base[i + 1], sizeof(Snorm16))
-          copyMem(addr k2v, addr base[i + 3], sizeof(Snorm16))
-          yield Action(kind: actLens, k1: k1v, k2: k2v)
-          i += 5
-        of actSpeed:
-          var v: float32
-          copyMem(addr v, addr base[i + 1], sizeof(float32))
-          var act = Action(kind: actSpeed, val: v,
-            varispeed: (base[i] and varispeedFlag) != 0'u8)
-          var pos = i + 5
-          # A ramp stores its mean negated, then its easing and keyframes.
-          if v < 0:
-            act.val = -v
-            act.hasEase = base[pos] != 0'u8
-            pos += 1
-            if act.hasEase:
-              act.easeCurve = Easing(base[pos].int)
-              pos += 1
-            let (count, timed) = unpackCount(base, pos)
-            act.sKf = newSeq[float32](count)
-            for c in 0 ..< count:
-              copyMem(addr act.sKf[c], addr base[pos], sizeof(float32))
-              pos += 4
-            if timed: act.sKt = unpackTimes(base, pos, count)
-          yield act
-          i = pos
-        of actDeesser:
-          var iu, mu, fu: Unorm16
-          copyMem(addr iu, addr base[i + 1], sizeof(Unorm16))
-          copyMem(addr mu, addr base[i + 3], sizeof(Unorm16))
-          copyMem(addr fu, addr base[i + 5], sizeof(Unorm16))
-          yield Action(kind: actDeesser, intensity: iu, maxd: mu, freq: fu)
-          i += 7
-        of actDuck:
-          var amt, thr: Unorm16
-          var atk, rel: uint16
-          copyMem(addr amt, addr base[i + 1], sizeof(Unorm16))
-          copyMem(addr thr, addr base[i + 3], sizeof(Unorm16))
-          copyMem(addr atk, addr base[i + 5], sizeof(uint16))
-          copyMem(addr rel, addr base[i + 7], sizeof(uint16))
-          yield Action(kind: actDuck, duckAmount: amt, duckThresh: thr,
-            duckAttack: atk, duckRelease: rel)
-          i += 9
-        of actConvolve:
-          var n: uint16
-          copyMem(addr n, addr base[i + 1], sizeof(uint16))
-          var path = newString(n.int)
-          if n > 0: copyMem(addr path[0], addr base[i + 3], n.int)
-          yield Action(kind: actConvolve, irPath: path)
-          i += 3 + n.int
-        of actBurn, actText:
-          var act = if kind == actText: Action(kind: actText) else: Action(kind: actBurn)
-          act.burnVertical = (base[i] and verticalFlag) != 0'u8
-          var pos = i + 1
-          for path in [addr act.burnFile, addr act.burnFont]:
-            var n: uint16
-            copyMem(addr n, addr base[pos], sizeof(uint16))
-            path[] = newString(n.int)
-            if n > 0: copyMem(addr path[][0], addr base[pos + 2], n.int)
-            pos += 2 + n.int
-          copyMem(addr act.burnSize, addr base[pos], sizeof(float32))
-          act.burnSet = cast[set[BurnPart]](base[pos + 4])
-          act.burnAlign = base[pos + 5]
-          copyMem(addr act.burnColors, addr base[pos + 6], 12)
-          yield act
-          i = pos + 18
-        of actSpin:
-          var st: Unorm16
-          var rate: float32
-          copyMem(addr st, addr base[i + 1], sizeof(Unorm16))
-          copyMem(addr rate, addr base[i + 3], sizeof(float32))
-          yield Action(kind: actSpin, sStart: st, sRate: rate)
-          i += 7
-        of actColorKey, actChromaKey:
-          let col = RGBColor(red: base[i + 1], green: base[i + 2], blue: base[i + 3],
-            yuv: (base[i] and yuvFlag) != 0'u8)
-          var sim, blend: Unorm16
-          copyMem(addr sim, addr base[i + 4], sizeof(Unorm16))
-          copyMem(addr blend, addr base[i + 6], sizeof(Unorm16))
-          yield Action(kind: kind, color: col, similar: sim, blend: blend)
-          i += 8
-        of actChoke:
-          yield Action(kind: actChoke, chokeN: base[i + 1])
-          i += 2
-        of actMask, actConfine:
-          let flags = base[i + 1]
-          let feather = base[i + 2]
-          var x, y, w, h, radius: int32
-          copyMem(addr x, addr base[i + 3], sizeof(int32))
-          copyMem(addr y, addr base[i + 7], sizeof(int32))
-          copyMem(addr w, addr base[i + 11], sizeof(int32))
-          copyMem(addr h, addr base[i + 15], sizeof(int32))
-          copyMem(addr radius, addr base[i + 19], sizeof(int32))
-          yield Action(kind: kind, mRadius: radius,
-            mReset: (flags and 0x2'u8) != 0, mInvert: (flags and 0x1'u8) != 0,
-            mFeather: feather, mX: x, mY: y, mW: w, mH: h)
-          i += 23
-        of actMaskPoly, actConfinePoly:
-          let invert = (base[i + 1] and 0x1'u8) != 0'u8
-          let feather = base[i + 2]
-          var n: uint16
-          copyMem(addr n, addr base[i + 3], sizeof(uint16))
-          var xs = newSeq[int32](n.int)
-          var ys = newSeq[int32](n.int)
-          var pos = i + 5
-          for k in 0 ..< n.int:
-            copyMem(addr xs[k], addr base[pos], sizeof(int32))
-            copyMem(addr ys[k], addr base[pos + 4], sizeof(int32))
-            pos += 8
-          yield Action(kind: kind, mFeather: feather, mInvert: invert,
-            mPolyXs: xs, mPolyYs: ys)
-          i = pos
-        of actPixelate:
-          let hasEase = (base[i] and easeFlag) != 0'u8
-          var pos = i + 1
-          var act = Action(kind: actPixelate, hasEase: hasEase)
-          if hasEase:
-            act.easeCurve = Easing(base[pos].int)
-            act.easeDurUnit = DurUnit(base[pos + 1].int)
-            copyMem(addr act.easeDur, addr base[pos + 2], sizeof(float32))
-            pos += 6
-          for which in 0 .. 1:  # width, then height keyframes
-            let (count, timed) = unpackCount(base, pos)
-            var sizes = newSeq[float32](count)
-            for c in 0 ..< count:
-              var v: uint16
-              copyMem(addr v, addr base[pos], sizeof(uint16))
-              sizes[c] = v.float32
-              pos += 2
-            let times = (if timed: unpackTimes(base, pos, count) else: @[])
-            if which == 0: (act.pixWKf, act.pixWKt) = (sizes, times)
-            else: (act.pixHKf, act.pixHKt) = (sizes, times)
-          yield act
-          i = pos
-        of actConfetti:
-          var count, seed: uint16
-          var gravity: float32
-          copyMem(addr count, addr base[i + 1], sizeof(uint16))
-          copyMem(addr gravity, addr base[i + 3], sizeof(float32))
-          copyMem(addr seed, addr base[i + 8], sizeof(uint16))
-          let flags = base[i + 7]
-          yield Action(kind: actConfetti, cCount: count, cGravity: gravity,
-            cScheme: ConfettiScheme((flags and schemeMask).int),
-            cShimmer: (flags and shimmerFlag) != 0'u8,
-            cOrigin: ConfettiOrigin(((flags shr originShift) and originMask).int),
-            cSeed: seed)
-          i += 10
-        of actAberration:
-          yield Action(kind: actAberration,
-            abRh: cast[int8](base[i + 1]), abRv: cast[int8](base[i + 2]),
-            abGh: cast[int8](base[i + 3]), abGv: cast[int8](base[i + 4]),
-            abBh: cast[int8](base[i + 5]), abBv: cast[int8](base[i + 6]),
-            abWrap: base[i + 7] != 0'u8)
-          i += 8
-        of actLuv:
-          var bh: Snorm16
-          var c, s: float32
-          copyMem(addr bh, addr base[i + 1], sizeof(Snorm16))
-          copyMem(addr c, addr base[i + 3], sizeof(float32))
-          copyMem(addr s, addr base[i + 7], sizeof(float32))
-          yield Action(kind: actLuv, brighthue: bh, contrast: c, saturation: s)
-          i += 11
-        of actPos:
-          let hasEase = (base[i] and easeFlag) != 0'u8
-          var pos = i + 1
-          var act = Action(kind: actPos, hasEase: hasEase)
-          if hasEase:
-            act.easeCurve = Easing(base[pos].int)
-            act.easeDurUnit = DurUnit(base[pos + 1].int)
-            copyMem(addr act.easeDur, addr base[pos + 2], sizeof(float32))
-            pos += 6
-          for which in 0 .. 2:  # x, y, scale keyframe seqs in order
-            let (count, timed) = unpackCount(base, pos)
-            var s = newSeq[float32](count)
-            for c in 0 ..< count:
-              copyMem(addr s[c], addr base[pos], sizeof(float32))
-              pos += 4
-            let times = (if timed: unpackTimes(base, pos, count) else: @[])
-            case which
-            of 0: (act.pxKf, act.pxKt) = (s, times)
-            of 1: (act.pyKf, act.pyKt) = (s, times)
-            else: (act.pscaleKf, act.pscaleKt) = (s, times)
-          yield act
-          i = pos
-        of actDrawbox:
-          var x, y, w, h: int32
-          copyMem(addr x, addr base[i + 1], sizeof(int32))
-          copyMem(addr y, addr base[i + 5], sizeof(int32))
-          copyMem(addr w, addr base[i + 9], sizeof(int32))
-          copyMem(addr h, addr base[i + 13], sizeof(int32))
-          let col = RGBColor(red: base[i + 17], green: base[i + 18], blue: base[i + 19],
-            yuv: (base[i] and yuvFlag) != 0'u8)
-          yield Action(kind: actDrawbox, dbX: x, dbY: y, dbW: w, dbH: h, dbColor: col)
-          i += 20
-        of actZoom, actBlur, actOpacity, actBrightness, actVolume:
-          let hasEase = (base[i] and easeFlag) != 0'u8
-          var pos = i + 1
-          var act = Action(kind: kind)
-          act.hasEase = hasEase
-          if hasEase:
-            act.easeCurve = Easing(base[pos].int)
-            act.easeDurUnit = DurUnit(base[pos + 1].int)
-            copyMem(addr act.easeDur, addr base[pos + 2], sizeof(float32))
-            pos += 6
-          let (count, timed) = unpackCount(base, pos)
-          act.kf = newSeq[float32](count)
-          for c in 0 ..< count:
-            if kind in {actZoom, actBlur, actVolume}:
-              var v: float32
-              copyMem(addr v, addr base[pos], sizeof(float32))
-              act.kf[c] = v
-              pos += 4
-            elif kind == actOpacity:
-              var u: Unorm16
-              copyMem(addr u, addr base[pos], sizeof(Unorm16))
-              act.kf[c] = u.toFloat32
-              pos += 2
-            else:
-              var s: Snorm16
-              copyMem(addr s, addr base[pos], sizeof(Snorm16))
-              act.kf[c] = s.toFloat32
-              pos += 2
-          if timed: act.kt = unpackTimes(base, pos, count)
-          yield act
-          i = pos
+        yield decodeAt(base, i)
 
   func `==`*(a, b: Actions): bool =
     let ia = int(a)
@@ -1915,6 +1965,13 @@ when not defined(nimscript):
         base.writeAt(i, 3, a.maxd)
         base.writeAt(i, 5, a.freq)
         i += 7
+      of actHighpass, actLowpass:
+        base.writeAt(i, 1, a.cutoff)
+        i += 3
+      of actDehum:
+        base.writeAt(i, 1, a.humHz)
+        base[i + 3] = a.humHarmonics
+        i += 4
       of actDuck:
         base.writeAt(i, 1, a.duckAmount)
         base.writeAt(i, 3, a.duckThresh)

@@ -291,6 +291,7 @@ proc reformat*(frame: ptr AVFrame, format: AVPixelFormat, width: cint = 0,
   newFrame.height = dstHeight
   newFrame.pts = frame.pts
   newFrame.time_base = frame.time_base
+  newFrame.flags = frame.flags and (8 or 16).cint
   newFrame.color_primaries = frame.color_primaries
   newFrame.color_trc = frame.color_trc
   if srcFormat.isRgb == format.isRgb:
@@ -915,14 +916,6 @@ proc makeNewVideoFrames*(output: var OutputContainer, tl: v3, args: mainArgs,
   var pix_fmt = AV_PIX_FMT_YUV420P
   let targetFps = tl.tb
 
-  # Reference source for encoder config (color/pix_fmt/SAR): the base video
-  # layer's first clip. Don't derive this from uniqueSources iteration order,
-  # which is pointer-hash order over `ptr string` keys and so varies run-to-run
-  # (e.g. an `add:` overlay image could win over the actual video).
-  var firstSrc: ptr string = nil
-  if tl.v.len > 0 and tl.v[0].len > 0:
-    firstSrc = tl.v[0][0].src
-
   for src in tl.uniqueSources:
     # getContainer turns a missing/unreadable source (e.g. `add:gone.mp4`)
     # into a clean error instead of an unhandled IOError.
@@ -937,8 +930,6 @@ proc makeNewVideoFrames*(output: var OutputContainer, tl: v3, args: mainArgs,
     # no video stream to decode.
     if myCache.cns[src].video.len == 0:
       continue
-    if firstSrc == nil:
-      firstSrc = src
 
     let decoderCtx = initDecoder(myCache.cns[src].video[0].codecpar)
     decoderCtx.thread_type = FF_THREAD_FRAME or FF_THREAD_SLICE
@@ -980,13 +971,20 @@ proc makeNewVideoFrames*(output: var OutputContainer, tl: v3, args: mainArgs,
   encoderCtx.framerate = targetFps
   encoderCtx.thread_type = FF_THREAD_FRAME or FF_THREAD_SLICE
 
-  # For encoder config (colorspace/SAR/pix_fmt) prefer a real, non-still video
-  # source. An audio-only `add` timeline may have only still images over a
-  # synthesized background, in which case yuv420p defaults are used.
-  for s in tl.uniqueSources:
-    if myCache.cns[s].video.len > 0 and not srcs[s].isStill:
-      firstSrc = s
-      break
+  # Reference source for encoder config (color/pix_fmt/SAR): the first real,
+  # non-still video in layer and clip order, so the base layer wins. Not from
+  # uniqueSources, whose order follows the `ptr string` keys' addresses and so
+  # changes from run to run. An audio-only `add` timeline may have only still
+  # images over a synthesized background, in which case yuv420p defaults are
+  # used.
+  var firstSrc: ptr string = nil
+  block pick:
+    for layer in tl.v:
+      for clip in layer:
+        let s = clip.src
+        if s != nil and myCache.cns[s].video.len > 0 and not srcs[s].isStill:
+          firstSrc = s
+          break pick
 
   # Don't inherit color tags / SAR from a still image. PNGs are tagged full-range
   # (which makes the H.264 encoder emit deprecated yuvj420p), so when the only
@@ -1378,7 +1376,7 @@ proc makeNewVideoFrames*(output: var OutputContainer, tl: v3, args: mainArgs,
       confineThis = confineActive and effect.kind in confinable
       case effect.kind:
       of actSpeed, actVolume, actDeesser, actDuck, actPitch, actTone, actConvolve,
-          actPos, actRotate, actLoop: discard
+          actHighpass, actLowpass, actDehum, actPos, actRotate, actLoop: discard
       of actScale, actTurn:
         # An overlay is scaled and turned where it's placed, about its center.
         if isOverlay or placeDone: continue
@@ -2120,7 +2118,9 @@ proc makeNewVideoFrames*(output: var OutputContainer, tl: v3, args: mainArgs,
   # Each layer's clips by start, and those started but not yet ended, so a
   # frame looks only at the clips under it instead of every clip in the layer.
   var byStart = newSeq[seq[int]](tl.v.len)
-  for li, layer in tl.v:
+  for li in 0 ..< tl.v.len:
+    # The sort's closure would copy the whole layer to capture it.
+    let layer {.cursor.} = tl.v[li]
     for ci in 0 ..< layer.len: byStart[li].add ci
     byStart[li].sort(proc(a, b: int): int = cmp(layer[a].start, layer[b].start))
   var nextStart = newSeq[int](tl.v.len)

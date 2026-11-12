@@ -2,7 +2,7 @@ import std/[atomics, json, math, strformat, strutils, sequtils, tables]
 
 import ../[action, av, ffmpeg, graph, log, resampler, timeline]
 import ../util/rational
-import ../lib/dnorm16
+import ../lib/[biquad, dnorm16]
 import ./convolve
 
 # Import C string functions for JSON capture
@@ -468,6 +468,21 @@ proc createFilterGraph(effects: openArray[Action], sr: cint,
 
   return (filterGraph, bufferSrc, bufferSink)
 
+func filtersOf(act: Action, sr: float64): seq[Biquad] =
+  const butterworthQ = 1.0 / sqrt(2.0)
+  # Narrow enough to leave the voice between harmonics alone.
+  const humQ = 30.0
+  case act.kind
+  of actHighpass: @[initBiquad(bqHighpass, act.cutoff.float64, butterworthQ, sr)]
+  of actLowpass: @[initBiquad(bqLowpass, act.cutoff.float64, butterworthQ, sr)]
+  of actDehum:
+    var filters: seq[Biquad]
+    for n in 1 .. act.humHarmonics.int:
+      let f = act.humHz.float64 * n.float64
+      if f < sr * 0.49: filters.add initBiquad(bqNotch, f, humQ, sr)
+    filters
+  else: @[]
+
 proc applyVolume(data: var seq[int16], act: Action, channels: int, sr: cint,
     fps: float) =
   ## Multiply samples by the volume envelope (a static value or keyframe ramp
@@ -725,6 +740,10 @@ proc processAudioClip(ef: seq[Actions], clip: Clip, data: seq[int16], sourceSr,
     of actConvolve:
       runPending()
       applyConvolve(processedData, effect.irPath, channels.int, sourceSr)
+    of actHighpass, actLowpass, actDehum:
+      runPending()
+      applyBiquads(processedData, filtersOf(effect, sourceSr.float64),
+        channels.int)
     else: discard
   if rampTempo.len > 0 and pending.len == 0:
     pending.add Action(kind: actSpeed, val: 1)
@@ -910,7 +929,8 @@ proc makeAudioFrames*(fmt: AVSampleFormat, tl: v3, frameSize: int, layerIndices:
   ## so it needs 0). A set `stop` ends the iterator at its next call, freeing
   ## what it holds.
 
-  var samples: Table[(string, int16), Getter]
+  # Paths are interned, so a path's pointer names its getter without a copy.
+  var samples: Table[(ptr string, int16), Getter]
   let targetChannels = tl.layout.nb_channels
   let tb = tl.tb
   let sr = tl.sr
@@ -929,7 +949,7 @@ proc makeAudioFrames*(fmt: AVSampleFormat, tl: v3, frameSize: int, layerIndices:
       for clip in tl.a[layerIndex]:
         if clip.src == nil:
           continue
-        let key = (clip.src[], clip.stream)
+        let key = (clip.src, clip.stream)
         if key notin samples:
           samples[key] = newGetter(clip.src[], clip.stream, sr)
 
@@ -981,7 +1001,7 @@ proc makeAudioFrames*(fmt: AVSampleFormat, tl: v3, frameSize: int, layerIndices:
       srcData = synthTone(tableFor(tone), noteFreq(tone.note), startSample,
         int(round(durSamples.float64 * speed)), targetChannels, sr)
     else:
-      let key = (clip.src[], clip.stream)
+      let key = (clip.src, clip.stream)
       if key notin samples:
         return (@[], srcLayout)
       let getter = samples[key]
