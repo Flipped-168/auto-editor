@@ -207,6 +207,8 @@ type
     cn: InputContainer
     decoder: ptr AVCodecContext
     held: ptr AVFrame           # last decoded frame, held for forward reuse
+    deint: Graph                # bwdif, from the first interlaced frame on
+    deintNext: ptr AVFrame      # decoded at a size change, while deint drains
     frameIndex: int             # current source position; -1 = none yet
     seekThreshold: int          # don't seek-ahead before this frame
     seekFrame: int              # frame we seeked from, for frames-saved debug
@@ -214,7 +216,10 @@ type
     lastReqIndex: int           # last obj.index requested (held-frame reuse)
     loopBase: int               # source frames consumed by completed loops
     usedAt: int64               # timeline frame it last decoded for; -1 = never
+    deintW, deintH, deintFmt: cint # what deint was built for
     ownsCn: bool                # opened for this decoder, not the media cache's
+    deintDone: bool             # deint has been sent end-of-stream
+    interlaced: bool            # has given an interlaced frame; seeks keep it
     hasSeekFrame: bool          # whether seekFrame holds a pending marker
 
   SrcState = ref object
@@ -228,6 +233,77 @@ type
     isStill: bool               # single-frame image source (logo/watermark)
 
 const maxDecoders = 4 # per source; past this a busy decoder seeks instead
+
+proc resetDeint(st: DecState) =
+  ## Drop the deinterlacer's frames, as a seek drops the decoder's.
+  st.deint.cleanup()
+  st.deint = nil
+  st.deintDone = false
+  if st.deintNext != nil:
+    av_frame_free(addr st.deintNext)
+
+proc nextFrame(st: DecState, stream: ptr AVStream, frame: ptr AVFrame): bool =
+  ## Decode the next frame into `frame`, false at the end of the stream.
+  ## No encoder here codes fields (VideoToolbox can't at all), and effects and
+  ## scaling would blend the two, so interlaced pictures come out deinterlaced
+  ## by bwdif. It needs the frame after the one it outputs, so it runs one
+  ## frame behind the decoder; progressive sources never start it.
+  while true:
+    if st.deint != nil and st.deint.tryPull(frame):
+      if frame.pts != AV_NOPTS_VALUE:
+        frame.pts = av_rescale_q(frame.pts, st.deint.sinkTimeBase,
+          stream.time_base)
+      return true
+    if st.deintNext != nil:
+      # The old graph has given up its last frame; the new size starts fresh.
+      st.deint.cleanup()
+      st.deint = nil
+      av_frame_unref(frame)
+      av_frame_move_ref(frame, st.deintNext)
+      av_frame_free(addr st.deintNext)
+    elif st.deintDone:
+      return false
+    else:
+      var got = false
+      for _ in st.cn.flushDecode(stream.index.cint, st.decoder, frame):
+        got = true
+        break
+      if not got and st.deint != nil:
+        # flushDecode also stops on a decode error, after which decoding
+        # resumes; only the decoder's own end of stream ends bwdif's.
+        let ret = avcodec_receive_frame(st.decoder, frame)
+        if ret == 0:
+          got = true
+        elif ret == AVERROR_EOF:
+          st.deint.flush()
+          st.deintDone = true
+          continue
+      if not got:
+        return false
+      if st.deint != nil and (frame.width != st.deintW or
+          frame.height != st.deintH or frame.format != st.deintFmt):
+        # A graph can't change size: drain it, then start another.
+        st.deintNext = av_frame_alloc()
+        if st.deintNext == nil:
+          error "Could not allocate frame"
+        av_frame_move_ref(st.deintNext, frame)
+        st.deint.flush()
+        continue
+    if st.deint == nil:
+      if (frame.flags and 8) == 0: # AV_FRAME_FLAG_INTERLACED
+        return true
+      let tb = stream.time_base
+      st.deint = newGraph()
+      let bsrc = st.deint.add("buffer",
+        &"video_size={frame.width}x{frame.height}:pix_fmt={frame.format}:" &
+        &"time_base={tb.num}/{tb.den}:pixel_aspect=1/1:" &
+        &"colorspace={frame.colorspace}:range={frame.color_range}")
+      let filt = st.deint.add("bwdif", "mode=send_frame:parity=auto:deint=interlaced")
+      let bsink = st.deint.add("buffersink")
+      st.deint.linkNodes(bsrc, filt, bsink).configure()
+      (st.deintW, st.deintH, st.deintFmt) = (frame.width, frame.height, frame.format)
+      st.interlaced = true
+    st.deint.push(frame)
 
 proc newDecState(cn: InputContainer, decoder: ptr AVCodecContext,
     ownsCn: bool): DecState =
@@ -453,6 +529,9 @@ proc fillBox(frame: ptr AVFrame, x, y, w, h: int32, color: RGBColor) =
       u[col] = uv
       v[col] = vv
 
+proc memset(p: pointer, c: cint, n: csize_t): pointer {.importc,
+    header: "<string.h>", discardable.}
+
 proc makeSolid(width: cint, height: cint, color: RGBColor,
     tag = untagged): ptr AVFrame =
   let frame: ptr AVFrame = av_frame_alloc()
@@ -477,28 +556,22 @@ proc makeSolid(width: cint, height: cint, color: RGBColor,
   let yLinesize: cint = frame.linesize[0]
 
   for y in 0 ..< height:
-    let row: ptr uint8 = cast[ptr uint8](cast[int](yData) + y.int * yLinesize.int)
-    let rowArray = cast[ptr UncheckedArray[uint8]](row)
-    for x in 0 ..< width:
-      rowArray[x] = yValue
+    memset(cast[pointer](cast[int](yData) + y.int * yLinesize.int),
+      yValue.cint, csize_t(width))
 
   let uData: ptr uint8 = frame.data[1]
   let uLinesize: cint = frame.linesize[1]
 
   for y in 0 ..< (height div 2):
-    let row: ptr uint8 = cast[ptr uint8](cast[int](uData) + y.int * uLinesize.int)
-    let rowArray = cast[ptr UncheckedArray[uint8]](row)
-    for x in 0 ..< (width div 2):
-      rowArray[x] = uValue
+    memset(cast[pointer](cast[int](uData) + y.int * uLinesize.int),
+      uValue.cint, csize_t((width div 2)))
 
   let vData: ptr uint8 = frame.data[2]
   let vLinesize: cint = frame.linesize[2]
 
   for y in 0 ..< (height div 2):
-    let row: ptr uint8 = cast[ptr uint8](cast[int](vData) + y.int * vLinesize.int)
-    let rowArray = cast[ptr UncheckedArray[uint8]](row)
-    for x in 0 ..< (width div 2):
-      rowArray[x] = vValue
+    memset(cast[pointer](cast[int](vData) + y.int * vLinesize.int),
+      vValue.cint, csize_t((width div 2)))
 
   return frame
 
@@ -808,11 +881,11 @@ proc drawConfetti(frame: ptr AVFrame, act: Action, local: int, fps: float) =
     fillChip(frame, poly, color)
 
 proc scaleWithPad(src: ptr AVFrame, targetW, targetH: int32,
-    bg: RGBColor, tag: YuvTag): ptr AVFrame =
+    bg: RGBColor, tag: YuvTag, swsCtx: var ptr SwsContext): ptr AVFrame =
   ## Scale src to fit within targetW x targetH preserving aspect ratio,
   ## centering with bg color padding. Returns a new YUV420P frame.
-  ## Uses sws_scale_frame + manual pixel copy to avoid filter graph NEON
-  ## crashes on Windows ARM64.
+  ## Uses sws_scale_frame rather than a filter graph to avoid NEON crashes
+  ## on Windows ARM64.
   let srcW = src.width
   let srcH = src.height
 
@@ -832,58 +905,45 @@ proc scaleWithPad(src: ptr AVFrame, targetW, targetH: int32,
   output.pts = src.pts
   output.time_base = src.time_base
 
-  # Scale + convert to YUV420P. Use a valid sws context but don't pre-allocate
-  # the destination buffer — sws_scale_frame calls av_frame_get_buffer itself
-  # when dst->data[0] is null, which avoids failures with unusual source frame
-  # layouts (e.g. dvvideo). A nil context is not safe in FFmpeg 8.1+.
-  var scaled = av_frame_alloc()
-  if scaled == nil:
-    av_frame_free(addr output)
-    error "Could not allocate scaled frame"
-  scaled.format = AV_PIX_FMT_YUV420P.cint
-  scaled.colorspace = tag.space
-  scaled.color_range = tag.range
-  scaled.width = scaledW
-  scaled.height = scaledH
-  # Propagate interlaced flags so sws_frame_setup doesn't reject mismatched frames.
-  # AV_FRAME_FLAG_INTERLACED = 1<<3, AV_FRAME_FLAG_TOP_FIELD_FIRST = 1<<4
-  scaled.flags = src.flags and (8 or 16).cint
-  var swsCtx = sws_alloc_context()
-  if swsCtx == nil:
-    av_frame_free(addr scaled)
-    av_frame_free(addr output)
-    error "Could not allocate sws context in scaleWithPad"
-  discard av_opt_set_int(swsCtx, "threads", 0, 0)
-  let scaleRet = sws_scale_frame(swsCtx, scaled, src)
-  sws_free_context(addr swsCtx)
-  if scaleRet < 0:
-    av_frame_free(addr scaled)
-    av_frame_free(addr output)
-    error &"Could not scale frame in scaleWithPad: {scaleRet}"
-
   # Even pixel offsets required for YUV420P chroma subsampling
   let ox = ((targetW - scaledW) div 2) and not 1.cint
   let oy = ((targetH - scaledH) div 2) and not 1.cint
 
-  for y in 0 ..< scaled.height.int:
-    let sp = cast[pointer](cast[int](scaled.data[0]) + y * scaled.linesize[0].int)
-    let dp = cast[pointer](cast[int](output.data[0]) + (oy.int + y) * output.linesize[
-        0].int + ox.int)
-    copyMem(dp, sp, scaled.width.int)
+  # Scale straight into the centered region: planes that point into `output`
+  # are buffers sws_scale_frame fills as given, and owning none, the view
+  # frees nothing of them.
+  var view = av_frame_alloc()
+  if view == nil:
+    av_frame_free(addr output)
+    error "Could not allocate scaled frame"
+  view.format = AV_PIX_FMT_YUV420P.cint
+  view.colorspace = tag.space
+  view.color_range = tag.range
+  view.width = scaledW
+  view.height = scaledH
+  # Propagate interlaced flags so sws_frame_setup doesn't reject mismatched frames.
+  # AV_FRAME_FLAG_INTERLACED = 1<<3, AV_FRAME_FLAG_TOP_FIELD_FIRST = 1<<4
+  view.flags = src.flags and (8 or 16).cint
+  for p in 0 .. 2:
+    let (dx, dy) = (if p == 0: (ox.int, oy.int) else: (ox.int div 2, oy.int div 2))
+    view.linesize[p] = output.linesize[p]
+    view.data[p] = cast[ptr uint8](cast[int](output.data[p]) +
+      dy * output.linesize[p].int + dx)
 
-  for y in 0 ..< (scaled.height div 2).int:
-    let sp = cast[pointer](cast[int](scaled.data[1]) + y * scaled.linesize[1].int)
-    let dp = cast[pointer](cast[int](output.data[1]) + ((oy div 2).int + y) *
-        output.linesize[1].int + (ox div 2).int)
-    copyMem(dp, sp, (scaled.width div 2).int)
-
-  for y in 0 ..< (scaled.height div 2).int:
-    let sp = cast[pointer](cast[int](scaled.data[2]) + y * scaled.linesize[2].int)
-    let dp = cast[pointer](cast[int](output.data[2]) + ((oy div 2).int + y) *
-        output.linesize[2].int + (ox div 2).int)
-    copyMem(dp, sp, (scaled.width div 2).int)
-
-  av_frame_free(addr scaled)
+  # One context for the render: it keeps its setup until the sizes or
+  # formats it's given change, which building one per frame repeated.
+  if swsCtx == nil:
+    swsCtx = sws_alloc_context()
+    if swsCtx == nil:
+      av_frame_free(addr view)
+      av_frame_free(addr output)
+      error "Could not allocate sws context in scaleWithPad"
+    discard av_opt_set_int(swsCtx, "threads", 0, 0)
+  let scaleRet = sws_scale_frame(swsCtx, view, src)
+  av_frame_free(addr view)
+  if scaleRet < 0:
+    av_frame_free(addr output)
+    error &"Could not scale frame in scaleWithPad: {scaleRet}"
   return output
 
 func scaledVideoResolution*(resolution: (int32, int32),
@@ -1139,6 +1199,7 @@ proc makeNewVideoFrames*(output: var OutputContainer, tl: v3, args: mainArgs,
   # Scaling has stable input/output geometry, so keep one libswscale
   # context instead of sending every frame through a filter graph.
   var scaleCtx: ptr SwsContext = nil
+  var padCtx: ptr SwsContext = nil # scaleWithPad's
   if needsScaling:
     scaleCtx = sws_alloc_context()
     if scaleCtx == nil:
@@ -1421,7 +1482,7 @@ proc makeNewVideoFrames*(output: var OutputContainer, tl: v3, args: mainArgs,
         if not isOverlay:
           # Base layer must stay canvas-sized: shrink the contained square back
           # to the original frame size, centered with bg padding.
-          let fitted = scaleWithPad(frame, w, h, tl.bg, solidTag)
+          let fitted = scaleWithPad(frame, w, h, tl.bg, solidTag, padCtx)
           if fitted != frame:
             av_frame_free(addr frame)
             frame = fitted
@@ -1785,16 +1846,20 @@ proc makeNewVideoFrames*(output: var OutputContainer, tl: v3, args: mainArgs,
       # sparsely-cued containers can report just a single keyframe).
       # observedKeyframes is kept strictly ascending, so upperBound-1 is the
       # floor; frame 0 is always a valid seek point.
-      let idx = upperBound(ss.observedKeyframes, target) - 1
+      # bwdif needs the frame before the target, so for an interlaced source
+      # land on a keyframe before that one too.
+      let want = if st.interlaced: max(0, target - 1) else: target
+      let idx = upperBound(ss.observedKeyframes, want) - 1
       let seekTarget = if idx >= 0: ss.observedKeyframes[idx] else: 0
       if seekTarget < 0 or seekTarget > target:
         let indexInfo = if ss.hasKfIndex: &"{ss.kfFrames.len} indexed" else: "no index"
         error &"Cannot seek backward: no suitable keyframe found (frameIndex: {frameIndex}, target: {target}, seekTarget: {seekTarget}, {indexInfo})"
       debug &"Seek backward: from {frameIndex} to keyframe {seekTarget} (need frame {target})"
       st.cn.seek(
-        videoFrameToTimestamp(seekTarget, ss.frameRate, myStream.time_base),
-        stream = myStream)
+        videoFrameToTimestamp(seekTarget, ss.frameRate, myStream.time_base) +
+        st.cn.startPts(myStream), stream = myStream)
       avcodec_flush_buffers(st.decoder)
+      st.resetDeint()
       st.lastSeekTarget = seekTarget
       frameIndex = min(seekTarget, target - 1)
 
@@ -1813,23 +1878,23 @@ proc makeNewVideoFrames*(output: var OutputContainer, tl: v3, args: mainArgs,
           hasSeekFrame = true
           debug &"Seek: {frameIndex} -> {target}"
           st.cn.seek(
-            videoFrameToTimestamp(target, ss.frameRate, myStream.time_base),
-            stream = myStream)
+            videoFrameToTimestamp(
+              if st.interlaced: max(0, target - 1) else: target,
+              ss.frameRate, myStream.time_base) +
+            st.cn.startPts(myStream), stream = myStream)
           avcodec_flush_buffers(st.decoder)
+          st.resetDeint()
           st.lastSeekTarget = target
 
-      let decoder: ptr AVCodecContext = st.decoder
       var foundFrame = false
-      for decodedFrame in st.cn.flushDecode(
-          myStream.index.cint, decoder, frame):
-        frame = decodedFrame
-        frameIndex = int(round(
-          decodedFrame.time(myStream.time_base) * ss.frameRate.float))
-        if decodedFrame.pict_type == AV_PICTURE_TYPE_I and
+      if st.nextFrame(myStream, frame):
+        frameIndex = int(round((frame.time(myStream.time_base) -
+          float(st.cn.startPts(myStream) * myStream.time_base)) *
+          ss.frameRate.float))
+        if frame.pict_type == AV_PICTURE_TYPE_I and
             frameIndex > ss.observedKeyframes[^1]:
           ss.observedKeyframes.add frameIndex
         foundFrame = true
-        break
 
       if foundFrame and holdPastEnd:
         if lastGood != nil: av_frame_free(addr lastGood)
@@ -1841,6 +1906,7 @@ proc makeNewVideoFrames*(output: var OutputContainer, tl: v3, args: mainArgs,
           target = obj.index - loopBase
           st.cn.seek(0, stream = myStream)
           avcodec_flush_buffers(st.decoder)
+          st.resetDeint()
           st.lastSeekTarget = -1
           frameIndex = -1
           continue
@@ -2071,7 +2137,7 @@ proc makeNewVideoFrames*(output: var OutputContainer, tl: v3, args: mainArgs,
     var (acc, didDecode) = decodeClipFrame(o)
     if didDecode and (acc.width.int32, acc.height.int32) != tl.res:
       let oldAcc = acc
-      acc = scaleWithPad(acc, tl.res[0], tl.res[1], tl.bg, solidTag)
+      acc = scaleWithPad(acc, tl.res[0], tl.res[1], tl.bg, solidTag, padCtx)
       av_frame_free(addr oldAcc)
     if acc != nil and acc.width > 0 and acc.height > 0:
       acc = applyEffects(acc, o.effects, o.local, o.dur, src = o.src,
@@ -2344,7 +2410,7 @@ proc makeNewVideoFrames*(output: var OutputContainer, tl: v3, args: mainArgs,
           # costs one sws_scale rather than one per decoded frame).
           if (frame.width.int32, frame.height.int32) != tl.res:
             let oldFrame = frame
-            frame = scaleWithPad(frame, tl.res[0], tl.res[1], tl.bg, solidTag)
+            frame = scaleWithPad(frame, tl.res[0], tl.res[1], tl.bg, solidTag, padCtx)
             av_frame_free(addr oldFrame)
         else:
           # No new frame decoded: keep the pre-initialized `frame` (nullFrame, or
@@ -2379,6 +2445,7 @@ proc makeNewVideoFrames*(output: var OutputContainer, tl: v3, args: mainArgs,
     if maskMatte != nil: av_frame_free(addr maskMatte)
     if confineMatte != nil: av_frame_free(addr confineMatte)
     sws_free_context(addr scaleCtx)
+    sws_free_context(addr padCtx)
     sws_free_context(addr reformatCtx)
     sws_free_context(addr zoomCtx)
     av_frame_free(addr frame)
@@ -2395,6 +2462,7 @@ proc makeNewVideoFrames*(output: var OutputContainer, tl: v3, args: mainArgs,
         if d.held != nil:
           var hf = d.held
           av_frame_free(addr hf)
+        d.resetDeint()
         var p = d.decoder
         avcodec_free_context(addr p)
         if d.ownsCn: d.cn.close()

@@ -653,6 +653,7 @@ proc av_samples_alloc*(audio_data: ptr ptr uint8, linesize: ptr cint, nb_channel
 
 proc av_strdup*(s: cstring): cstring {.importc, header: "<libavutil/mem.h>".}
 proc av_freep*(`ptr`: pointer) {.importc, header: "<libavutil/mem.h>".}
+proc av_mallocz*(size: csize_t): pointer {.importc, header: "<libavutil/mem.h>".}
 
 type SwrContext* {.importc, header: "<libswresample/swresample.h>".} = object
 
@@ -873,6 +874,8 @@ proc av_buffersrc_write_frame*(ctx: ptr AVFilterContext,
     frame: ptr AVFrame): cint {.importc, header: "<libavfilter/buffersrc.h>".}
 proc av_buffersink_get_frame*(ctx: ptr AVFilterContext,
     frame: ptr AVFrame): cint {.importc, header: "<libavfilter/buffersink.h>".}
+proc av_buffersink_get_time_base*(ctx: ptr AVFilterContext): AVRational {.
+    importc, header: "<libavfilter/buffersink.h>".}
 proc av_buffersink_set_frame_size*(ctx: ptr AVFilterContext,
     frame_size: cuint) {.importc, header: "<libavfilter/buffersink.h>".}
 proc av_buffersink_get_frame_flags*(ctx: ptr AVFilterContext, frame: ptr AVFrame,

@@ -60,11 +60,52 @@ proc supportsContainer(codecId: AVCodecID, formatName: string): bool =
   else:
     false
 
-proc supportsStream(stream: ptr AVStream, encoder: ptr AVCodec,
-    codecId: AVCodecID): bool =
+proc h264Header(input: InputContainer, stream: ptr AVStream): seq[uint8] =
+  ## The stream's extradata, or else the parameter sets of its first packet
+  ## that has them: MPEG-TS carries them only in-band. Leaves the demuxer at
+  ## the start.
+  let par = stream.codecpar
+  if par.extradata != nil and par.extradata_size > 0:
+    result = newSeq[uint8](par.extradata_size)
+    copyMem(addr result[0], par.extradata, par.extradata_size)
+    return
+  var seen = 0
+  while seen < 300 and av_read_frame(input.formatContext, input.packet) >= 0:
+    let packet = input.packet
+    if packet.stream_index == stream.index:
+      inc seen
+      result = annexBParameterSets(packet.data, packet.size.int)
+    av_packet_unref(packet)
+    if result.len > 0: break
+  discard av_seek_frame(input.formatContext, -1, 0, AVSEEK_FLAG_BACKWARD)
+
+proc seekToKeyBefore(input: InputContainer, stream: ptr AVStream, ts: int64) =
+  ## Seek so the next keyframe read is at or before `ts`. MPEG-TS seeks by
+  ## estimate and can land past it, which would drop the frames between, so
+  ## back off a second at a time, doubling, until it doesn't.
+  let second = av_rescale_q(1, AVRational(num: 1, den: 1), stream.time_base)
+  var margin = 0'i64
+  while true:
+    let target = ts - margin
+    input.seek(target, stream = stream)
+    var key = AV_NOPTS_VALUE
+    while key == AV_NOPTS_VALUE and
+        av_read_frame(input.formatContext, input.packet) >= 0:
+      let packet = input.packet
+      if packet.stream_index == stream.index and
+          (packet.flags and AV_PKT_FLAG_KEY) != 0:
+        key = (if packet.pts != AV_NOPTS_VALUE: packet.pts else: packet.dts)
+      av_packet_unref(packet)
+    if key == AV_NOPTS_VALUE or key <= ts or target <= input.startPts(stream):
+      input.seek(target, stream = stream)
+      return
+    margin = (if margin == 0: second else: margin * 2)
+
+proc supportsStream(input: InputContainer, stream: ptr AVStream,
+    encoder: ptr AVCodec, codecId: AVCodecID): bool =
   let pixelFormat = AVPixelFormat(stream.codecpar.format)
   if codecId == ID_H264:
-    stream.h264SupportsPartialLossless
+    h264SupportsPartialLossless(stream.codecpar.format, h264Header(input, stream))
   elif codecId == ID_HEVC:
     stream.hevcSupportsPartialLossless(encoder)
   elif codecId == ID_VP9:
@@ -106,10 +147,11 @@ proc fillLeadingDts*(packets: openArray[ptr AVPacket], nextDts, frameDuration: i
 
 proc scanGops(input: InputContainer, stream: ptr AVStream, fps: AVRational,
     codecId: AVCodecID): tuple[keyframes: seq[int64], sourceEnd: int64] =
+  let start = input.startPts(stream)
   while av_read_frame(input.formatContext, input.packet) >= 0:
     let packet = input.packet
     if packet.stream_index == stream.index and packet.pts != AV_NOPTS_VALUE:
-      let frame = frameAt(packet.pts, stream.time_base, fps)
+      let frame = frameAt(packet.pts - start, stream.time_base, fps)
       result.sourceEnd = max(result.sourceEnd, frame + 1)
       if (packet.flags and AV_PKT_FLAG_KEY) != 0 and
           packetIsCopyBoundary(codecId, packet.data, packet.size.int):
@@ -165,7 +207,7 @@ proc partialLosslessPlan*(output: OutputContainer, tl: v3, args: mainArgs,
   if stream.codecpar.codec_id != codecId or
       stream.codecpar.width != tl.res[0] or
       stream.codecpar.height != tl.res[1] or
-      not stream.supportsStream(encoder, codecId) or
+      not input.supportsStream(stream, encoder, codecId) or
       not stream.avg_frame_rate.isValid or stream.avg_frame_rate != tl.tb:
     return
 
@@ -177,6 +219,11 @@ proc partialLosslessPlan*(output: OutputContainer, tl: v3, args: mainArgs,
 
   let plan = smartRenderPlan(tl.v[0], keyframes, sourceEnd)
   let stats = smartPlanStats(plan)
+  # Re-encoded frames are deinterlaced, so copying some of an interlaced
+  # source's GOPs would mix field-coded and progressive pictures in one
+  # stream. Copying all of them keeps it whole.
+  if stream.codecpar.field_order notin [0.cint, 1] and stats.encodeRuns > 0:
+    return
   let averageGop = averageGopFrames(keyframes, sourceEnd)
   if not smartPlanIsWorthwhile(stats, tl.len, sourceEnd, averageGop):
     let label = codecId.codecLabel
@@ -200,7 +247,12 @@ proc initPartialEncoder(video: VideoSettings, par: ptr AVCodecParameters,
   encoder.profile = par.profile
   encoder.bit_rate = max(par.bit_rate * 6 div 5, 1_000_000)
   if codecId.isNalCodec:
-    encoder.max_b_frames = max(par.video_delay, 0)
+    # VideoToolbox reorders a B-pyramid two deep whatever it's asked for, and
+    # FFmpeg's wrapper shifts its DTS by one, so a B-frame lands with its DTS
+    # past its PTS. It encodes in order instead; emitEncoded shifts the DTS.
+    encoder.max_b_frames =
+      if ($encoder.codec.name).endsWith("_videotoolbox"): 0
+      else: max(par.video_delay, 0)
     encoder.flags |= AV_CODEC_FLAG_GLOBAL_HEADER
   elif codecId == ID_AV1 and video.crf >= 0 and video.bitrate < 0:
     # SVT-AV1 rejects CRF mode when a target bitrate is also configured. The
@@ -220,8 +272,16 @@ proc makePartialLossless*(output: var OutputContainer, tl: v3, video: VideoSetti
   let sourcePath = tl.v[0][0].src[]
   var templateInput = try: av.open(sourcePath) except IOError as e: error e.msg
   let sourceStream = templateInput.video[0]
-  let sourceParameterSets = parameterSetsFor(codecId,
-    sourceStream.codecpar.extradata, sourceStream.codecpar.extradata_size)
+  let header =
+    if codecId == ID_H264: h264Header(templateInput, sourceStream)
+    else:
+      let par = sourceStream.codecpar
+      var bytes = newSeq[uint8](max(par.extradata_size, 0))
+      if bytes.len > 0: copyMem(addr bytes[0], par.extradata, bytes.len)
+      bytes
+  let sourceParameterSets =
+    if header.len == 0: newSeq[uint8]()
+    else: parameterSetsFor(codecId, unsafeAddr header[0], header.len)
 
   let stats = smartPlanStats(spans)
   if stats.copiedFrames == 0:
@@ -229,6 +289,18 @@ proc makePartialLossless*(output: var OutputContainer, tl: v3, video: VideoSetti
     error &"Partial-lossless {label} renderer selected without a complete GOP"
 
   let outputStream = output.addStreamFromTemplate(sourceStream)
+  let sourceAnnexB = header.len > 0 and isAnnexB(unsafeAddr header[0], header.len)
+  if sourceAnnexB and codecId == ID_H264:
+    # The muxer reads Annex B extradata as Annex B samples, but every sample
+    # here is length-prefixed, so it gets an avcC instead.
+    let avcC = annexBToAvcC(unsafeAddr header[0], header.len)
+    let par = outputStream.codecpar
+    av_freep(addr par.extradata)
+    par.extradata = cast[ptr uint8](av_mallocz(csize_t(avcC.len + 64)))
+    if par.extradata == nil:
+      error "Could not allocate avcC"
+    copyMem(par.extradata, unsafeAddr avcC[0], avcC.len)
+    par.extradata_size = avcC.len.cint
   if sourceStream.metadata != nil:
     discard av_dict_copy(addr outputStream.metadata, sourceStream.metadata, 0)
   outputStream.time_base = sourceStream.time_base
@@ -246,6 +318,7 @@ proc makePartialLossless*(output: var OutputContainer, tl: v3, video: VideoSetti
     # for HEVC, `hev1` permits in-band sets where `hvc1` requires them in hvcC.
     outputStream.codecpar.codec_tag =
       if codecId == ID_H264: fourccToInt("avc1") else: fourccToInt("hev1")
+  let sourceDelay = max(sourceStream.codecpar.video_delay, 0).int64
   templateInput.close()
 
   debug &"Using {label} partial-lossless rendering: copying {stats.copiedFrames}/{tl.len} frames across {spans.len} spans and {stats.encodeRuns} encoder runs"
@@ -274,6 +347,7 @@ proc makePartialLossless*(output: var OutputContainer, tl: v3, video: VideoSetti
 
     var encoder: ptr AVCodecContext = nil
     var encodedParameterSets: seq[uint8] = @[]
+    var encodedAnnexB = true
     var firstPacket = false
     var firstFrameInRun = false
 
@@ -286,10 +360,15 @@ proc makePartialLossless*(output: var OutputContainer, tl: v3, video: VideoSetti
         error &"Could not clone encoded {label} packet"
       outPacket.flags = outPacket.flags and not AV_PKT_FLAG_DISCARD
       outPacket.time_base = encoder.time_base
+      if encoder.max_b_frames == 0 and outPacket.pts != AV_NOPTS_VALUE:
+        # An encoder that doesn't reorder still has to leave the copied GOPs'
+        # decode delay between DTS and PTS, as one with B-frames does.
+        outPacket.dts = outPacket.pts - sourceDelay
       outPacket.stream_index = outputStream.index
       if isNal:
         outPacket.normalizeLengthPrefixed(
-          if firstPacket: encodedParameterSets else: noParameterSets, label)
+          if firstPacket: encodedParameterSets else: noParameterSets, label,
+          encodedAnnexB)
       firstPacket = false
       let orderTs =
         if outPacket.dts != AV_NOPTS_VALUE: outPacket.dts
@@ -299,8 +378,9 @@ proc makePartialLossless*(output: var OutputContainer, tl: v3, video: VideoSetti
 
     for spanIndex, span in spans:
       if span.kind == ssCopy:
-        let seekTs = av_rescale_q(span.srcStart, frameTb, stream.time_base)
-        input.seek(seekTs, stream = stream)
+        input.seekToKeyBefore(stream,
+          av_rescale_q(span.srcStart, frameTb, stream.time_base) +
+          input.startPts(stream))
         var first = true
         var copied = 0'i64
         var shift = 0'i64
@@ -324,7 +404,8 @@ proc makePartialLossless*(output: var OutputContainer, tl: v3, video: VideoSetti
               sourcePacket.pts == AV_NOPTS_VALUE:
             av_packet_unref(sourcePacket)
             continue
-          let sourceFrame = frameAt(sourcePacket.pts, stream.time_base, tl.tb)
+          let sourceFrame = frameAt(sourcePacket.pts - input.startPts(stream),
+            stream.time_base, tl.tb)
           if sourceFrame >= span.srcEnd:
             # HEVC stops at the next closed random-access picture, not merely at
             # the first packet whose presentation timestamp belongs to the next
@@ -374,7 +455,10 @@ proc makePartialLossless*(output: var OutputContainer, tl: v3, video: VideoSetti
             outPacket.time_base = stream.time_base
           outPacket.stream_index = outputStream.index
           if isFirst and isNal:
-            outPacket.normalizeLengthPrefixed(sourceParameterSets, label)
+            outPacket.normalizeLengthPrefixed(sourceParameterSets, label,
+              sourceAnnexB)
+          elif sourceAnnexB:
+            outPacket.normalizeLengthPrefixed(noParameterSets, label, true)
           av_packet_unref(sourcePacket)
           if codecId == ID_H264 and not sawDts and outPacket.dts == AV_NOPTS_VALUE:
             undated.add outPacket
@@ -390,6 +474,10 @@ proc makePartialLossless*(output: var OutputContainer, tl: v3, video: VideoSetti
           if isNal:
             encodedParameterSets = parameterSetsFor(codecId, encoder.extradata,
               encoder.extradata_size)
+            # With a global header, an avcC/hvcC one means its packets are
+            # length-prefixed already.
+            encodedAnnexB = encoder.extradata == nil or
+              isAnnexB(encoder.extradata, encoder.extradata_size)
             let complete =
               if codecId == ID_H264: encodedParameterSets.len > 0
               else: encodedParameterSets.hasRequiredParameterSets
@@ -398,18 +486,17 @@ proc makePartialLossless*(output: var OutputContainer, tl: v3, video: VideoSetti
           firstPacket = true
           firstFrameInRun = true
 
-        let seekTs = av_rescale_q(span.srcStart, frameTb, stream.time_base)
-        input.seek(seekTs, stream = stream)
+        input.seekToKeyBefore(stream,
+          av_rescale_q(span.srcStart, frameTb, stream.time_base) +
+          input.startPts(stream))
         avcodec_flush_buffers(decoder)
         var encoded = 0'i64
         var lastDecoded: ptr AVFrame = nil
         for decoded in input.flushDecode(stream.index, decoder, frame):
-          let sourceFrame = int64(round(
-            decoded.time(stream.time_base) * float(tl.tb)))
+          let sourceFrame = int64(round((decoded.time(stream.time_base) -
+            float(input.startPts(stream) * stream.time_base)) * float(tl.tb)))
           if sourceFrame < span.srcStart:
             continue
-          if sourceFrame >= span.srcEnd:
-            break
           # A WebCodecs decoder hands over whatever layout the browser picked
           # (NV12 from hardware decoders), while the encoder was opened for
           # the stream's own format.
@@ -417,18 +504,26 @@ proc makePartialLossless*(output: var OutputContainer, tl: v3, video: VideoSetti
           if lastDecoded != nil:
             av_frame_free(addr lastDecoded)
           lastDecoded = av_frame_clone(toEncode)
-          toEncode.pts = span.outStart + encoded
-          toEncode.time_base = frameTb
-          toEncode.duration = 1
-          toEncode.pict_type =
-            if firstFrameInRun: AV_PICTURE_TYPE_I
-            else: AV_PICTURE_TYPE_NONE
-          firstFrameInRun = false
-          for encodedPacket in encoder.encode(toEncode, packet):
-            emitEncoded(encodedPacket)
+          # Like the normal renderer, a frame with no picture of its own, as
+          # before a stream that starts late, shows the next one decoded.
+          let upTo = min(sourceFrame, span.srcEnd - 1)
+          while span.srcStart + encoded <= upTo:
+            let slot = av_frame_clone(toEncode)
+            slot.pts = span.outStart + encoded
+            slot.time_base = frameTb
+            slot.duration = 1
+            slot.pict_type =
+              if firstFrameInRun: AV_PICTURE_TYPE_I
+              else: AV_PICTURE_TYPE_NONE
+            firstFrameInRun = false
+            for encodedPacket in encoder.encode(slot, packet):
+              emitEncoded(encodedPacket)
+            av_frame_free(addr slot)
+            inc encoded
           if toEncode != decoded:
             av_frame_free(addr toEncode)
-          inc encoded
+          if sourceFrame >= span.srcEnd - 1:
+            break
 
         # Container duration rounding can leave the timeline one frame longer
         # than the final decoded timestamp. Match the normal renderer by holding
